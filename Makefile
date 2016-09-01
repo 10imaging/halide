@@ -11,25 +11,42 @@
 
 ifeq ($(OS), Windows_NT)
     # assume we are building for the MinGW environment
+    LLVM_CONFIG ?= llvm-config
+    CLANG ?= clang
     LIBDL =
     SHARED_EXT=dll
     FPIC=
+    $(info "Using Windows")
 else
-    # let's assume "normal" UNIX such as linux
+ifeq ($(findstring darwin, $(OSTYPE)),)
+    LLVM_CONFIG ?= llvm-config-3.7
+    CLANG ?= clang-3.7
     LIBDL=-ldl
     SHARED_EXT=so
     FPIC=-fPIC
+    $(info "Using OSX")
+    RVAL = $(shell $(LLVM_CONFIG) --components)
+    ifeq (${RVAL},)
+      $(error "${LLVM_CONFIG} not found. install with 'brew install homebrew/versions/llvm37'")
+    endif
+else
+    # let's assume "normal" UNIX such as linux
+    LLVM_CONFIG ?= llvm-config
+    CLANG ?= clang
+    LIBDL=-ldl
+    SHARED_EXT=so
+    FPIC=-fPIC
+    $(info "Using Linux")
+endif
 endif
 
 SHELL = bash
 CXX ?= g++
 PREFIX ?= /usr/local
-LLVM_CONFIG ?= llvm-config
 LLVM_COMPONENTS= $(shell $(LLVM_CONFIG) --components)
 LLVM_VERSION = $(shell $(LLVM_CONFIG) --version | cut -b 1-3)
 
 LLVM_FULL_VERSION = $(shell $(LLVM_CONFIG) --version)
-CLANG ?= clang
 CLANG_VERSION = $(shell $(CLANG) --version)
 LLVM_BINDIR = $(shell $(LLVM_CONFIG) --bindir | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g')
 LLVM_LIBDIR = $(shell $(LLVM_CONFIG) --libdir | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g')
