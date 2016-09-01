@@ -9,6 +9,13 @@
 #     For correctness and performance tests this include halide build time and run time. For
 #     the tests in test/generator/ this times only the halide build time.
 
+where-am-i = $(CURDIR)/$(word $(words $(MAKEFILE_LIST)),$(MAKEFILE_LIST))
+
+THIS_MAKEFILE = $(abspath $(call where-am-i))
+THIS_MAKEFILE_PATH := $(abspath $(subst Makefile,,$(THIS_MAKEFILE)))
+
+$(info THIS=$(THIS_MAKEFILE) THIS_PATH=$(THIS_MAKEFILE_PATH))
+
 ifeq ($(OS), Windows_NT)
     # assume we are building for the MinGW environment
     LLVM_CONFIG ?= llvm-config
@@ -19,15 +26,22 @@ ifeq ($(OS), Windows_NT)
     $(info "Using Windows")
 else
 ifeq ($(findstring darwin, $(OSTYPE)),)
-    LLVM_CONFIG ?= llvm-config-3.7
-    CLANG ?= clang-3.7
     LIBDL=-ldl
     SHARED_EXT=so
     FPIC=-fPIC
     $(info "Using OSX")
-    RVAL = $(shell $(LLVM_CONFIG) --components)
+    RVAL = $(wildcard $(THIS_MAKEFILE_PATH)/llvm-3.7/build/bin/llvm-config)
     ifeq (${RVAL},)
-      $(error "${LLVM_CONFIG} not found. install with 'brew install homebrew/versions/llvm37'")
+      RVAL = $(shell $(LLVM_CONFIG) --components)
+      LLVM_CONFIG ?= llvm-config-3.7
+      CLANG ?= clang-3.7
+      ifeq (${RVAL},)
+        $(error "${LLVM_CONFIG} not found. install with 'brew install homebrew/versions/llvm37'")
+      endif
+    else
+      $(info using built-in llvm and clang)
+      LLVM_CONFIG := $(THIS_MAKEFILE_PATH)/llvm-3.7/build/bin/llvm-config
+      CLANG := $(THIS_MAKEFILE_PATH)/llvm-3.7/build/bin/clang
     endif
 else
     # let's assume "normal" UNIX such as linux
@@ -40,9 +54,12 @@ else
 endif
 endif
 
+$(info LLVM_CONFIG=$(LLVM_CONFIG))
+$(info CLANG=$(CLANG))
+
 SHELL = bash
 CXX ?= g++
-PREFIX ?= /usr/local
+HALIDE_INSTALL_PATH ?= /usr/local
 LLVM_COMPONENTS= $(shell $(LLVM_CONFIG) --components)
 LLVM_VERSION = $(shell $(LLVM_CONFIG) --version | cut -b 1-3)
 
@@ -1263,22 +1280,22 @@ Doxyfile: Doxyfile.in
 	    $< > $@
 
 install: $(LIB_DIR)/libHalide.a $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(RUNTIME_EXPORTED_INCLUDES)
-	mkdir -p $(PREFIX)/include $(PREFIX)/bin $(PREFIX)/lib $(PREFIX)/share/halide/tutorial/images $(PREFIX)/share/halide/tools $(PREFIX)/share/halide/tutorial/figures
-	cp $(LIB_DIR)/libHalide.a $(BIN_DIR)/libHalide.$(SHARED_EXT) $(PREFIX)/lib
-	cp $(INCLUDE_DIR)/Halide.h $(PREFIX)/include
-	cp $(INCLUDE_DIR)/HalideRuntim*.h $(PREFIX)/include
-	cp $(ROOT_DIR)/tutorial/images/*.png $(PREFIX)/share/halide/tutorial/images
-	cp $(ROOT_DIR)/tutorial/figures/*.gif $(PREFIX)/share/halide/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/figures/*.jpg $(PREFIX)/share/halide/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/figures/*.mp4 $(PREFIX)/share/halide/tutorial/figures
-	cp $(ROOT_DIR)/tutorial/*.cpp $(PREFIX)/share/halide/tutorial
-	cp $(ROOT_DIR)/tutorial/*.h $(PREFIX)/share/halide/tutorial
-	cp $(ROOT_DIR)/tutorial/*.sh $(PREFIX)/share/halide/tutorial
-	cp $(ROOT_DIR)/tools/mex_halide.m $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/GenGen.cpp $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/halide_image.h $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/halide_image_io.h $(PREFIX)/share/halide/tools
-	cp $(ROOT_DIR)/tools/halide_image_info.h $(PREFIX)/share/halide/tools
+	mkdir -p $(HALIDE_INSTALL_PATH)/include $(HALIDE_INSTALL_PATH)/bin $(HALIDE_INSTALL_PATH)/lib $(HALIDE_INSTALL_PATH)/share/halide/tutorial/images $(HALIDE_INSTALL_PATH)/share/halide/tools $(HALIDE_INSTALL_PATH)/share/halide/tutorial/figures
+	cp $(LIB_DIR)/libHalide.a $(BIN_DIR)/libHalide.$(SHARED_EXT) $(HALIDE_INSTALL_PATH)/lib
+	cp $(INCLUDE_DIR)/Halide.h $(HALIDE_INSTALL_PATH)/include
+	cp $(INCLUDE_DIR)/HalideRuntim*.h $(HALIDE_INSTALL_PATH)/include
+	cp $(ROOT_DIR)/tutorial/images/*.png $(HALIDE_INSTALL_PATH)/share/halide/tutorial/images
+	cp $(ROOT_DIR)/tutorial/figures/*.gif $(HALIDE_INSTALL_PATH)/share/halide/tutorial/figures
+	cp $(ROOT_DIR)/tutorial/figures/*.jpg $(HALIDE_INSTALL_PATH)/share/halide/tutorial/figures
+	cp $(ROOT_DIR)/tutorial/figures/*.mp4 $(HALIDE_INSTALL_PATH)/share/halide/tutorial/figures
+	cp $(ROOT_DIR)/tutorial/*.cpp $(HALIDE_INSTALL_PATH)/share/halide/tutorial
+	cp $(ROOT_DIR)/tutorial/*.h $(HALIDE_INSTALL_PATH)/share/halide/tutorial
+	cp $(ROOT_DIR)/tutorial/*.sh $(HALIDE_INSTALL_PATH)/share/halide/tutorial
+	cp $(ROOT_DIR)/tools/mex_halide.m $(HALIDE_INSTALL_PATH)/share/halide/tools
+	cp $(ROOT_DIR)/tools/GenGen.cpp $(HALIDE_INSTALL_PATH)/share/halide/tools
+	cp $(ROOT_DIR)/tools/halide_image.h $(HALIDE_INSTALL_PATH)/share/halide/tools
+	cp $(ROOT_DIR)/tools/halide_image_io.h $(HALIDE_INSTALL_PATH)/share/halide/tools
+	cp $(ROOT_DIR)/tools/halide_image_info.h $(HALIDE_INSTALL_PATH)/share/halide/tools
 
 $(DISTRIB_DIR)/halide.tgz: $(LIB_DIR)/libHalide.a $(BIN_DIR)/libHalide.$(SHARED_EXT) $(INCLUDE_DIR)/Halide.h $(RUNTIME_EXPORTED_INCLUDES)
 	mkdir -p $(DISTRIB_DIR)/include $(DISTRIB_DIR)/bin $(DISTRIB_DIR)/lib $(DISTRIB_DIR)/tutorial $(DISTRIB_DIR)/tutorial/images $(DISTRIB_DIR)/tools $(DISTRIB_DIR)/tutorial/figures

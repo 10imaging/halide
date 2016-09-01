@@ -387,7 +387,7 @@ building Clang/LLVM, but for trunk Clang/LLVM instead of 3.7.
     svn co http://llvm.org/svn/llvm-project/cfe/trunk ./tools/clang
     # Or:
     #    git clone http://llvm.org/git/llvm.git .
-    #    git clone http://llvm.org/git/clang.git llvm/tools
+    #    git clone http://llvm.org/git/clang.git llvm/tools/clang
     mkdir build
     cd build
     cmake -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_TARGETS_TO_BUILD="X86;ARM;NVPTX;AArch64;Mips;PowerPC;Hexagon" -DLLVM_ENABLE_ASSERTIONS=ON -DCMAKE_BUILD_TYPE=Release ..
