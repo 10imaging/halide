@@ -82,7 +82,7 @@ like so:
     % cd ..
     % mkdir halide_build
     % cd halide_build
-    % make -f ../Halide/Makefile
+    % make -f ../Makefile
 
 #### Building Halide with cmake
 
