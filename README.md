@@ -260,6 +260,7 @@ for which the color index is a compile-time constant can be scheduled.  The
 main consequence is that the range of color variables must be explicitly
 specified for both input and output buffers before scheduling:
 
+```
     ImageParam input;
     Func f;
     Var x, y, c;
@@ -268,7 +269,7 @@ specified for both input and output buffers before scheduling:
     input.set_bounds(2, 0, 3);   // specify color range for input
     f.bound(c, 0, 3);            // and output
     f.glsl(x, y, c);
-
+```
 
 #### JIT Compilation
 
@@ -289,6 +290,7 @@ On Linux, OS X, and Android, Halide creates its own OpenGL context unless the
 current thread already has an active context.  On other platforms you have to
 link implementations of the following two functions with your Halide code:
 
+```
     extern "C" int halide_opengl_create_context(void *) {
         return 0;  // if successful
     }
@@ -296,6 +298,7 @@ link implementations of the following two functions with your Halide code:
     extern "C" void *halide_opengl_get_proc_addr(void *, const char *name) {
         ...
     }
+```
 
 Halide allocates and deletes textures as necessary.  Applications may manage
 the textures by hand by setting the `buffer_t::dev` field; this is most useful
