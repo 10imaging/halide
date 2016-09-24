@@ -33,8 +33,7 @@ Building Halide
 
 #### TL;DR
 
-Have llvm-3.7 or greater installed and run 'make' in the root
-directory of the repository (where this README is).
+Have llvm-3.7 or greater installed and run 'make' in the root directory of the repository (where this README is).
 
 #### Acquiring LLVM
 
