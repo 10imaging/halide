@@ -81,7 +81,7 @@ protected:
     /** Compile a specific halide declaration into the llvm Module. */
     // @{
     virtual void compile_func(const LoweredFunc &func, const std::string &simple_name, const std::string &extern_name);
-    virtual void compile_buffer(const Buffer &buffer);
+    virtual void compile_buffer(const BufferPtr &buffer);
     // @}
 
     /** Helper functions for compiling Halide functions to llvm
@@ -232,7 +232,7 @@ protected:
 
     /** Some destructors should always be called. Others should only
      * be called if the pipeline is exiting with an error code. */
-    enum DestructorType {Always, OnError};
+    enum DestructorType {Always, OnError, OnSuccess};
 
     /* Call this at the location of object creation to register how an
      * object should be destroyed. This does three things:
@@ -492,6 +492,11 @@ private:
     llvm::Constant *embed_constant_expr(Expr e);
 
     llvm::Function *add_argv_wrapper(const std::string &name);
+
+    llvm::Value *codegen_dense_vector_load(const Load *load, llvm::Value *vpred = nullptr);
+
+    virtual void codegen_predicated_vector_load(const Call *load_addr, Expr predicate);
+    virtual void codegen_predicated_vector_store(const Call *store_addr, Expr predicate, Expr value);
 };
 
 }

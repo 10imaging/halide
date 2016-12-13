@@ -3,7 +3,6 @@
 #include "HalideRuntimeOpenGL.h"
 #include "HalideRuntimeOpenGLCompute.h"
 #include "HalideRuntimeOpenCL.h"
-#include "HalideRuntimeRenderscript.h"
 #include "HalideRuntimeMetal.h"
 #include "HalideRuntimeHexagonHost.h"
 #include "HalideRuntimeQurt.h"
@@ -66,6 +65,7 @@ extern "C" __attribute__((used)) void *halide_runtime_api_functions[] = {
     (void *)&halide_error_param_too_small_f64,
     (void *)&halide_error_param_too_small_i64,
     (void *)&halide_error_param_too_small_u64,
+    (void *)&halide_error_requirement_failed,
     (void *)&halide_error_unaligned_host_ptr,
     (void *)&halide_float16_bits_to_double,
     (void *)&halide_float16_bits_to_float,
@@ -109,6 +109,9 @@ extern "C" __attribute__((used)) void *halide_runtime_api_functions[] = {
     (void *)&halide_metal_release_context,
     (void *)&halide_metal_run,
     (void *)&halide_metal_wrap_buffer,
+    (void *)&halide_msan_annotate_buffer_is_initialized_as_destructor,
+    (void *)&halide_msan_annotate_buffer_is_initialized,
+    (void *)&halide_msan_annotate_memory_is_initialized,
     (void *)&halide_mutex_destroy,
     (void *)&halide_mutex_lock,
     (void *)&halide_mutex_unlock,
@@ -149,9 +152,6 @@ extern "C" __attribute__((used)) void *halide_runtime_api_functions[] = {
     (void *)&halide_qurt_hvx_unlock,
     (void *)&halide_qurt_hvx_unlock_as_destructor,
     (void *)&halide_release_jit_module,
-    (void *)&halide_renderscript_device_interface,
-    (void *)&halide_renderscript_initialize_kernels,
-    (void *)&halide_renderscript_run,
     (void *)&halide_set_custom_can_use_target_features,
     (void *)&halide_set_custom_do_par_for,
     (void *)&halide_set_custom_do_task,

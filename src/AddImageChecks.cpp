@@ -16,7 +16,7 @@ using std::pair;
 class FindBuffers : public IRGraphVisitor {
 public:
     struct Result {
-        Buffer image;
+        BufferPtr image;
         Parameter param;
         Type type;
         int dimensions;
@@ -146,7 +146,7 @@ Stmt add_image_checks(Stmt s,
 
     for (pair<const string, FindBuffers::Result> &buf : bufs) {
         const string &name = buf.first;
-        Buffer &image = buf.second.image;
+        BufferPtr &image = buf.second.image;
         Parameter &param = buf.second.param;
         Type type = buf.second.type;
         int dimensions = buf.second.dimensions;
@@ -311,9 +311,9 @@ Stmt add_image_checks(Stmt s,
             // is used in the schedule to combine multiple extents,
             // but it is here for extra safety. On targets with the
             // LargeBuffers feature, the maximum size is 2^63 - 1.
-            Expr max_size = make_const(Int(64), t.maximum_buffer_size());
-            Expr max_extent = make_const(Int(64), 0x7fffffff);
-            Expr actual_size = cast<int64_t>(actual_extent) * actual_stride;
+            Expr max_size = make_const(UInt(64), t.maximum_buffer_size());
+            Expr max_extent = make_const(UInt(64), 0x7fffffff);
+            Expr actual_size = abs(cast<int64_t>(actual_extent) * actual_stride);
             Expr allocation_size_error = Call::make(Int(32), "halide_error_buffer_allocation_too_large",
                                                     {name, actual_size, max_size}, Call::Extern);
             Stmt check = AssertStmt::make(actual_size <= max_size, allocation_size_error);
@@ -324,6 +324,7 @@ Stmt add_image_checks(Stmt s,
                 if (j == 0) {
                     lets_overflow.push_back(make_pair(name + ".total_extent." + dim, cast<int64_t>(actual_extent)));
                 } else {
+                    max_size = cast<int64_t>(max_size);
                     Expr last_dim = Variable::make(Int(64), name + ".total_extent." + std::to_string(j-1));
                     Expr this_dim = actual_extent * last_dim;
                     Expr this_dim_var = Variable::make(Int(64), name + ".total_extent." + dim);
@@ -387,7 +388,7 @@ Stmt add_image_checks(Stmt s,
 
                     stride_constrained = param.stride_constraint(i);
                 } else if (image.defined() && (int)i < image.dimensions()) {
-                    stride_constrained = image.stride(i);
+                    stride_constrained = image.dim(i).stride();
                 }
 
                 std::string min0_name = buffer_name + ".0.min." + dim;
@@ -404,9 +405,9 @@ Stmt add_image_checks(Stmt s,
                     extent_constrained = Variable::make(Int(32), extent0_name);
                 }
             } else if (image.defined() && (int)i < image.dimensions()) {
-                stride_constrained = image.stride(i);
-                extent_constrained = image.extent(i);
-                min_constrained = image.min(i);
+                stride_constrained = image.dim(i).stride();
+                extent_constrained = image.dim(i).extent();
+                min_constrained = image.dim(i).min();
             } else if (param.defined()) {
                 stride_constrained = param.stride_constraint(i);
                 extent_constrained = param.extent_constraint(i);
