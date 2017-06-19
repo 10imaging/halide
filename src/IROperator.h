@@ -188,6 +188,10 @@ struct BufferBuilder {
     EXPORT Expr build() const;
 };
 
+/** If e is a ramp expression with stride, default 1, return the base,
+ * otherwise undefined. */
+Expr strided_ramp_base(Expr e, int stride = 1);
+
 } // namespace Internal
 
 /** Cast an expression to the halide type corresponding to the C++ type T. */
@@ -807,10 +811,14 @@ inline Expr clamp(Expr a, Expr min_val, Expr max_val) {
         << "clamp of undefined Expr\n";
     Expr n_min_val = lossless_cast(a.type(), min_val);
     user_assert(n_min_val.defined())
-        << "clamp with possibly out of range minimum bound: " << min_val << "\n";
+        << "Type mismatch in call to clamp. First argument ("
+        << a << ") has type " << a.type() << ", but second argument ("
+        << min_val << ") has type " << min_val.type() << ". Use an explicit cast.\n";
     Expr n_max_val = lossless_cast(a.type(), max_val);
     user_assert(n_max_val.defined())
-        << "clamp with possibly out of range maximum bound: " << max_val << "\n";
+        << "Type mismatch in call to clamp. First argument ("
+        << a << ") has type " << a.type() << ", but third argument ("
+        << max_val << ") has type " << max_val.type() << ". Use an explicit cast.\n";
     return Internal::Max::make(Internal::Min::make(std::move(a), std::move(n_max_val)), std::move(n_min_val));
 }
 
@@ -1565,6 +1573,8 @@ inline Expr lerp(Expr zero_val, Expr one_val, Expr weight) {
 inline Expr popcount(Expr x) {
     user_assert(x.defined()) << "popcount of undefined Expr\n";
     Type t = x.type();
+    user_assert(t.is_uint() || t.is_int())
+        << "Argument to popcount must be an integer\n";
     return Internal::Call::make(t, Internal::Call::popcount,
                                 {std::move(x)}, Internal::Call::PureIntrinsic);
 }
@@ -1574,6 +1584,8 @@ inline Expr popcount(Expr x) {
 inline Expr count_leading_zeros(Expr x) {
     user_assert(x.defined()) << "count leading zeros of undefined Expr\n";
     Type t = x.type();
+    user_assert(t.is_uint() || t.is_int())
+        << "Argument to count_leading_zeros must be an integer\n";
     return Internal::Call::make(t, Internal::Call::count_leading_zeros,
                                 {std::move(x)}, Internal::Call::PureIntrinsic);
 }
@@ -1583,6 +1595,8 @@ inline Expr count_leading_zeros(Expr x) {
 inline Expr count_trailing_zeros(Expr x) {
     user_assert(x.defined()) << "count trailing zeros of undefined Expr\n";
     Type t = x.type();
+    user_assert(t.is_uint() || t.is_int())
+        << "Argument to count_trailing_zeros must be an integer\n";
     return Internal::Call::make(t, Internal::Call::count_trailing_zeros,
                                 {std::move(x)}, Internal::Call::PureIntrinsic);
 }
@@ -1757,7 +1771,8 @@ inline NO_INLINE Expr print_when(Expr condition, Expr a, Args&&... args) {
  * Note that this essentially *always* inserts a runtime check into the
  * generated code (except when the condition can be proven at compile time);
  * as such, it should be avoided inside inner loops, except for debugging
- * or testing purposes.
+ * or testing purposes. Note also that it does not vectorize cleanly (vector
+ * values will be scalarized for the check).
  *
  * However, using this to make assertions about (say) input values
  * can be useful, both in terms of correctness and (potentially) in terms
