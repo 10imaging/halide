@@ -33,7 +33,8 @@ Building Halide
 
 #### TL;DR
 
-Have llvm-3.7 or greater installed and run 'make' in the root directory of the repository (where this README is).
+Have llvm-3.7 or greater installed and run 'make' in the root
+directory of the repository (where this README is).
 
 #### Acquiring LLVM
 
@@ -81,7 +82,7 @@ like so:
     % cd ..
     % mkdir halide_build
     % cd halide_build
-    % make -f ../Makefile
+    % make -f ../Halide/Makefile
 
 #### Building Halide with cmake
 
@@ -217,7 +218,6 @@ for which the color index is a compile-time constant can be scheduled.  The
 main consequence is that the range of color variables must be explicitly
 specified for both input and output buffers before scheduling:
 
-```
     ImageParam input;
     Func f;
     Var x, y, c;
@@ -226,7 +226,7 @@ specified for both input and output buffers before scheduling:
     input.set_bounds(2, 0, 3);   // specify color range for input
     f.bound(c, 0, 3);            // and output
     f.glsl(x, y, c);
-```
+
 
 #### JIT Compilation
 
@@ -247,7 +247,6 @@ On Linux, OS X, and Android, Halide creates its own OpenGL context unless the
 current thread already has an active context.  On other platforms you have to
 link implementations of the following two functions with your Halide code:
 
-```
     extern "C" int halide_opengl_create_context(void *) {
         return 0;  // if successful
     }
@@ -255,7 +254,6 @@ link implementations of the following two functions with your Halide code:
     extern "C" void *halide_opengl_get_proc_addr(void *, const char *name) {
         ...
     }
-```
 
 Halide allocates and deletes textures as necessary.  Applications may manage
 the textures by hand by setting the `buffer_t::dev` field; this is most useful
@@ -347,7 +345,7 @@ building Clang/LLVM, but for trunk Clang/LLVM instead of 3.7.
     svn co http://llvm.org/svn/llvm-project/cfe/trunk ./tools/clang
     # Or:
     #    git clone http://llvm.org/git/llvm.git .
-    #    git clone http://llvm.org/git/clang.git llvm/tools/clang
+    #    git clone http://llvm.org/git/clang.git llvm/tools
     mkdir build
     cd build
     cmake -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_TARGETS_TO_BUILD="X86;ARM;NVPTX;AArch64;Mips;PowerPC;Hexagon" -DLLVM_ENABLE_ASSERTIONS=ON -DCMAKE_BUILD_TYPE=Release ..
