@@ -9,67 +9,33 @@
 #     For correctness and performance tests this include halide build time and run time. For
 #     the tests in test/generator/ this times only the halide build time.
 
-where-am-i = $(CURDIR)/$(word $(words $(MAKEFILE_LIST)),$(MAKEFILE_LIST))
-
-THIS_MAKEFILE = $(abspath $(call where-am-i))
-THIS_MAKEFILE_PATH := $(abspath $(subst Makefile,,$(THIS_MAKEFILE)))
-
-$(info THIS=$(THIS_MAKEFILE) THIS_PATH=$(THIS_MAKEFILE_PATH))
 UNAME = $(shell uname)
 
 ifeq ($(OS), Windows_NT)
     # assume we are building for the MinGW environment
-    LLVM_CONFIG ?= llvm-config
-    CLANG ?= clang
     LIBDL =
     SHARED_EXT=dll
     FPIC=
-    $(info "Using Windows")
-else
-ifeq ($(findstring darwin, $(OSTYPE)),)
-    LIBDL=-ldl
-    SHARED_EXT=so
-    FPIC=-fPIC
-    $(info "Using OSX")
-    RVAL = $(wildcard $(THIS_MAKEFILE_PATH)/llvm-3.7/build/bin/llvm-config)
-    ifeq (${RVAL},)
-      RVAL = $(shell $(LLVM_CONFIG) --components)
-      LLVM_CONFIG ?= llvm-config-3.7
-      CLANG ?= clang-3.7
-      ifeq (${RVAL},)
-        $(error "${LLVM_CONFIG} not found. install with 'brew install homebrew/versions/llvm37'")
-      endif
-    else
-      $(info using built-in llvm and clang)
-      LLVM_CONFIG := $(THIS_MAKEFILE_PATH)/llvm-3.7/build/bin/llvm-config
-      CLANG := $(THIS_MAKEFILE_PATH)/llvm-3.7/build/bin/clang
-    endif
 else
     # let's assume "normal" UNIX such as linux
-    LLVM_CONFIG ?= llvm-config
-    CLANG ?= clang
     LIBDL=-ldl
     FPIC=-fPIC
-    $(info "Using Linux")
 ifeq ($(UNAME), Darwin)
     SHARED_EXT=dylib
 else
     SHARED_EXT=so
 endif
 endif
-endif
-
-$(info LLVM_CONFIG=$(LLVM_CONFIG))
-$(info CLANG=$(CLANG))
 
 SHELL = bash
 CXX ?= g++
-HALIDE_INSTALL_PATH ?= /usr/local
-PREFIX = HALIDE_INSTALL_PATH
+PREFIX ?= /usr/local
+LLVM_CONFIG ?= llvm-config
 LLVM_COMPONENTS= $(shell $(LLVM_CONFIG) --components)
 LLVM_VERSION = $(shell $(LLVM_CONFIG) --version | cut -b 1-3)
 
 LLVM_FULL_VERSION = $(shell $(LLVM_CONFIG) --version)
+CLANG ?= clang
 CLANG_VERSION = $(shell $(CLANG) --version)
 LLVM_BINDIR = $(shell $(LLVM_CONFIG) --bindir | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g')
 LLVM_LIBDIR = $(shell $(LLVM_CONFIG) --libdir | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g')
