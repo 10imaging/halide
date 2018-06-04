@@ -50,6 +50,10 @@ struct Outputs {
      * output is desired. */
     std::string static_library_name;
 
+    /** The name of the emitted auto-schedule output file. Empty if no auto-schedule
+     * output is desired. */
+    std::string schedule_name;
+
     /** Make a new Outputs struct that emits everything this one does
      * and also an object file with the given name. */
     Outputs object(const std::string &object_name) const {
@@ -121,8 +125,16 @@ struct Outputs {
         updated.static_library_name = static_library_name;
         return updated;
     }
+
+    /** Make a new Outputs struct that emits everything this one does
+     * and also an auto-schedule output file with the given name. */
+    Outputs schedule(const std::string &schedule_name) const {
+        Outputs updated = *this;
+        updated.schedule_name = schedule_name;
+        return updated;
+    }
 };
 
-}
+}  // namespace Halide
 
 #endif

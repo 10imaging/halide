@@ -2,8 +2,8 @@
 #include <string>
 #include <vector>
 
-#include "InferArguments.h"
 #include "IRVisitor.h"
+#include "InferArguments.h"
 
 namespace Halide {
 namespace Internal {
@@ -11,7 +11,7 @@ namespace Internal {
 using std::set;
 using std::string;
 using std::vector;
-  
+
 namespace {
 
 class InferArguments : public IRGraphVisitor {
@@ -85,14 +85,13 @@ private:
 
     void include_parameter(Parameter p) {
         if (!p.defined()) return;
-        if (p.is_bound_before_lowering()) return;
         if (already_have(p.name())) return;
 
         Expr def, min, max;
         if (!p.is_buffer()) {
-            def = p.get_scalar_expr();
-            min = p.get_min_value();
-            max = p.get_max_value();
+            def = p.scalar_expr();
+            min = p.min_value();
+            max = p.max_value();
         }
 
         InferredArgument a = {
@@ -151,7 +150,7 @@ private:
     }
 };
 
-}
+}  // namespace
 
 vector<InferredArgument> infer_arguments(Stmt body, const vector<Function> &outputs) {
     vector<InferredArgument> inferred_args;
@@ -167,5 +166,5 @@ vector<InferredArgument> infer_arguments(Stmt body, const vector<Function> &outp
     return inferred_args;
 }
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide

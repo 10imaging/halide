@@ -11,17 +11,9 @@ namespace llvm {
 class Value;
 class Module;
 class Function;
-#if LLVM_VERSION >= 39
 class IRBuilderDefaultInserter;
-#else
-template<bool> class IRBuilderDefaultInserter;
-#endif
 class ConstantFolder;
-#if LLVM_VERSION >= 39
 template<typename, typename> class IRBuilder;
-#else
-template<bool, typename, typename> class IRBuilder;
-#endif
 class LLVMContext;
 class Type;
 class StructType;
@@ -36,17 +28,17 @@ class NamedMDNode;
 class DataLayout;
 class BasicBlock;
 class GlobalVariable;
-}
+}  // namespace llvm
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
-#include <memory>
 
 #include "IRVisitor.h"
 #include "Module.h"
-#include "Scope.h"
 #include "ModulusRemainder.h"
+#include "Scope.h"
 #include "Target.h"
 
 namespace Halide {
@@ -94,7 +86,7 @@ protected:
      * call to end_func with the same arguments, to generate the
      * appropriate cleanup code. */
     // @{
-    virtual void begin_func(LoweredFunc::LinkageType linkage, const std::string &simple_name,
+    virtual void begin_func(LinkageType linkage, const std::string &simple_name,
                             const std::string &extern_name, const std::vector<LoweredArgument> &args);
     virtual void end_func(const std::vector<LoweredArgument> &args);
     // @}
@@ -127,18 +119,17 @@ protected:
     static bool llvm_NVPTX_enabled;
     static bool llvm_Mips_enabled;
     static bool llvm_PowerPC_enabled;
+    static bool llvm_AMDGPU_enabled;
 
     const Module *input_module;
     std::unique_ptr<llvm::Module> module;
     llvm::Function *function;
     llvm::LLVMContext *context;
-#if LLVM_VERSION >= 39
     llvm::IRBuilder<llvm::ConstantFolder, llvm::IRBuilderDefaultInserter> *builder;
-#else
-    llvm::IRBuilder<true, llvm::ConstantFolder, llvm::IRBuilderDefaultInserter<true>> *builder;
-#endif
     llvm::Value *value;
     llvm::MDNode *very_likely_branch;
+    llvm::MDNode *default_fp_math_md;
+    llvm::MDNode *strict_fp_math_md;
     std::vector<LoweredArgument> current_function_args;
     //@}
 
@@ -451,14 +442,14 @@ protected:
     /** Get the result of modulus-remainder analysis for a given expr. */
     ModulusRemainder get_alignment_info(Expr e);
 
+    /** Alignment info for Int(32) variables in scope. */
+    Scope<ModulusRemainder> alignment_info;
+
 private:
 
     /** All the values in scope at the current code location during
      * codegen. Use sym_push and sym_pop to access. */
     Scope<llvm::Value *> symbol_table;
-
-    /** Alignment info for Int(32) variables in scope. */
-    Scope<ModulusRemainder> alignment_info;
 
     /** String constants already emitted to the module. Tracked to
      * prevent emitting the same string many times. */
@@ -469,13 +460,17 @@ private:
      * to this block. */
     llvm::BasicBlock *destructor_block;
 
+    /** Turn off all unsafe math flags in scopes while this is set. */
+    bool strict_float;
+
     /** Embed an instance of halide_filter_metadata_t in the code, using
      * the given name (by convention, this should be ${FUNCTIONNAME}_metadata)
      * as extern "C" linkage. Note that the return value is a function-returning-
      * pointer-to-constant-data.
      */
     llvm::Function* embed_metadata_getter(const std::string &metadata_getter_name,
-        const std::string &function_name, const std::vector<LoweredArgument> &args);
+        const std::string &function_name, const std::vector<LoweredArgument> &args,
+        const std::map<std::string, std::string> &metadata_name_map);
 
     /** Embed a constant expression as a global variable. */
     llvm::Constant *embed_constant_expr(Expr e);
@@ -488,12 +483,12 @@ private:
     virtual void codegen_predicated_vector_store(const Store *op);
 };
 
-}
+}  // namespace Internal
 
 /** Given a Halide module, generate an llvm::Module. */
-EXPORT std::unique_ptr<llvm::Module> codegen_llvm(const Module &module,
-                                                  llvm::LLVMContext &context);
+std::unique_ptr<llvm::Module> codegen_llvm(const Module &module,
+                                           llvm::LLVMContext &context);
 
-}
+}  // namespace Halide
 
 #endif

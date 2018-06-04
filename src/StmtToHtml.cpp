@@ -360,6 +360,8 @@ private:
             stream << keyword("gpu_block");
         } else if (op->for_type == ForType::GPUThread) {
             stream << keyword("gpu_thread");
+        } else if (op->for_type == ForType::GPULane) {
+            stream << keyword("gpu_lane");
         } else {
             internal_assert(false) << "Unknown for type: " << ((int)op->for_type) << "\n";
         }
@@ -493,7 +495,15 @@ private:
             if (i < op->bounds.size() - 1) stream << ", ";
         }
         stream << matched(")");
+        if (!is_one(op->condition)) {
+            stream << " " << keyword("if") << " ";
+            print(op->condition);
+        }
         stream << close_span();
+
+        stream << open_div("PrefetchBody");
+        print(op->body);
+        stream << close_div();
     }
 
     // To avoid generating ridiculously deep DOMs, we flatten blocks here.
@@ -632,6 +642,36 @@ public:
         stream << close_div();
     }
 
+    void print(const Module& m) {
+        scope.push(m.name(), unique_id());
+        for (const auto &s : m.submodules()) {
+            print(s);
+        }
+
+        int id = unique_id();
+        stream << open_expand_button(id);
+        stream << open_div("Module");
+        stream << open_span("Matched");
+        stream << keyword("module") << " name=" << m.name() << ", target=" << m.target().to_string();
+        stream << close_span();
+        stream << close_expand_button();
+        stream << " " << matched("{");
+
+        stream << open_div("ModuleBody Indent", id);
+
+        for (const auto &b : m.buffers()) {
+            print(b);
+        }
+        for (const auto &f : m.functions()) {
+            print(f);
+        }
+
+        stream << close_div();
+        stream << matched("}");
+        stream << close_div();
+        scope.pop(m.name());
+    }
+
     StmtToHtml(string filename) : id_count(0), context_stack(1, 0) {
         stream.open(filename.c_str());
         stream << "<head>";
@@ -700,12 +740,7 @@ void print_to_html(string filename, Stmt s) {
 
 void print_to_html(string filename, const Module &m) {
     StmtToHtml sth(filename);
-    for (const auto &b : m.buffers()) {
-        sth.print(b);
-    }
-    for (const auto &f : m.functions()) {
-        sth.print(f);
-    }
+    sth.print(m);
 }
 
 }

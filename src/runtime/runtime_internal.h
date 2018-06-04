@@ -74,7 +74,7 @@ void *memset(void *s, int val, size_t n);
 // Use fopen+fileno+fclose instead of open+close - the value of the
 // flags passed to open are different on every platform
 void *fopen(const char *, const char *);
-int fileno(void *); 
+int fileno(void *);
 int fclose(void *);
 int close(int);
 size_t fwrite(const void *, size_t, size_t, void *);
@@ -147,14 +147,12 @@ WEAK int halide_matlab_call_pipeline(void *user_context,
                                      int (*pipeline)(void **args), const halide_filter_metadata_t *metadata,
                                      int nlhs, mxArray **plhs, int nrhs, const mxArray **prhs);
 
-
-// Condition variables. Only available on some platforms (those that use the common thread pool).
+// Condition variables. Must be initialized with 0.
 struct halide_cond {
-    uint64_t _private[8];
+    uintptr_t _private[1];
 };
 
-WEAK void halide_cond_init(struct halide_cond *cond);
-WEAK void halide_cond_destroy(struct halide_cond *cond);
+WEAK void halide_cond_signal(struct halide_cond *cond);
 WEAK void halide_cond_broadcast(struct halide_cond *cond);
 WEAK void halide_cond_wait(struct halide_cond *cond, struct halide_mutex *mutex);
 
@@ -163,7 +161,8 @@ WEAK int halide_trace_helper(void *user_context,
                              void *value, int *coords,
                              int type_code, int type_bits, int type_lanes,
                              int code,
-                             int parent_id, int value_index, int dimensions);
+                             int parent_id, int value_index, int dimensions,
+                             const char *trace_tag);
 
 }  // extern "C"
 
@@ -216,6 +215,10 @@ __attribute__((always_inline)) T reinterpret(const U &x) {
     memcpy(&ret, &x, min(sizeof(T), sizeof(U)));
     return ret;
 }
+
+extern WEAK __attribute__((always_inline)) int halide_malloc_alignment();
+
+void halide_thread_yield();
 
 }}}
 

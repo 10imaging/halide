@@ -2,7 +2,9 @@
 #include <string>
 
 #include "Target.h"
+
 #include "Debug.h"
+#include "DeviceInterface.h"
 #include "Error.h"
 #include "LLVM_Headers.h"
 #include "Util.h"
@@ -65,14 +67,13 @@ Target calculate_host_target() {
 
     bool use_64_bits = (sizeof(size_t) == 8);
     int bits = use_64_bits ? 64 : 32;
+    std::vector<Target::Feature> initial_features;
 
 #if __mips__ || __mips || __MIPS__
     Target::Arch arch = Target::MIPS;
-    return Target(os, arch, bits);
 #else
 #if defined(__arm__) || defined(__aarch64__)
     Target::Arch arch = Target::ARM;
-    return Target(os, arch, bits);
 #else
 #if defined(__powerpc__) && defined(__linux__)
     Target::Arch arch = Target::POWERPC;
@@ -89,8 +90,6 @@ Target calculate_host_target() {
     std::vector<Target::Feature> initial_features;
     if (have_vsx)     initial_features.push_back(Target::VSX);
     if (arch_2_07)    initial_features.push_back(Target::POWER_ARCH_2_07);
-
-    return Target(os, arch, bits, initial_features);
 #else
     Target::Arch arch = Target::X86;
 
@@ -112,7 +111,6 @@ Target calculate_host_target() {
         << ", " << info[3]
         << std::dec << "\n";
 
-    std::vector<Target::Feature> initial_features;
     if (have_sse41) initial_features.push_back(Target::SSE41);
     if (have_avx)   initial_features.push_back(Target::AVX);
     if (have_f16c)  initial_features.push_back(Target::F16C);
@@ -158,10 +156,11 @@ Target calculate_host_target() {
 #endif
 #endif
 
+#endif
+#endif
+#endif
+
     return Target(os, arch, bits, initial_features);
-#endif
-#endif
-#endif
 }
 
 }  // namespace
@@ -238,6 +237,7 @@ const std::map<std::string, Target::Feature> feature_name_map = {
     {"cuda_capability_61", Target::CUDACapability61},
     {"opencl", Target::OpenCL},
     {"cl_doubles", Target::CLDoubles},
+    {"cl_half", Target::CLHalf},
     {"opengl", Target::OpenGL},
     {"openglcompute", Target::OpenGLCompute},
     {"user_context", Target::UserContext},
@@ -264,6 +264,12 @@ const std::map<std::string, Target::Feature> feature_name_map = {
     {"trace_loads", Target::TraceLoads},
     {"trace_stores", Target::TraceStores},
     {"trace_realizations", Target::TraceRealizations},
+    {"strict_float", Target::StrictFloat},
+    {"legacy_buffer_wrappers", Target::LegacyBufferWrappers},
+    {"tsan", Target::TSAN},
+    {"asan", Target::ASAN},
+    // NOTE: When adding features to this map, be sure to update
+    // PyEnums.cpp and halide.cmake as well.
 };
 
 bool lookup_feature(const std::string &tok, Target::Feature &result) {
@@ -289,6 +295,17 @@ Target get_target_from_environment() {
 Target get_jit_target_from_environment() {
     Target host = get_host_target();
     host.set_feature(Target::JIT);
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    host.set_feature(Target::ASAN);
+#endif
+#if __has_feature(memory_sanitizer)
+    host.set_feature(Target::MSAN);
+#endif
+#if __has_feature(thread_sanitizer)
+    host.set_feature(Target::TSAN);
+#endif
+#endif
     string target = Internal::get_env_variable("HL_JIT_TARGET");
     if (target.empty()) {
         return host;
@@ -345,6 +362,9 @@ bool merge_string(Target &t, const std::string &target) {
             os_specified = true;
         } else if (lookup_feature(tok, feature)) {
             t.set_feature(feature);
+            features_specified = true;
+        } else if (tok == "trace_all") {
+            t.set_features({Target::TraceLoads, Target::TraceStores, Target::TraceRealizations});
             features_specified = true;
         } else {
             return false;
@@ -464,6 +484,11 @@ std::string Target::to_string() const {
             result += "-" + feature_entry.first;
         }
     }
+    // Use has_feature() multiple times (rather than features_any_of())
+    // to avoid constructing a temporary vector for this rather-common call.
+    if (has_feature(Target::TraceLoads) && has_feature(Target::TraceStores) && has_feature(Target::TraceRealizations)) {
+        result = Internal::replace_all(result, "trace_loads-trace_realizations-trace_stores", "trace_all");
+    }
     return result;
 }
 
@@ -503,6 +528,30 @@ bool Target::supported() const {
     return !bad;
 }
 
+bool Target::supports_type(const Type &t, DeviceAPI device) const {
+    if (device == DeviceAPI::Default_GPU) {
+        device = get_default_device_api_for_target(*this);
+    }
+
+    if (device == DeviceAPI::Hexagon) {
+        // HVX supports doubles and long long in the scalar unit only.
+        if (t.is_float() || t.bits() == 64) {
+            return t.lanes() == 1;
+        }
+    } else if (device == DeviceAPI::Metal) {
+        // Metal spec says no double or long long.
+        if (t.bits() == 64) {
+            return false;
+        }
+    } else if (device == DeviceAPI::OpenCL) {
+        if (t.is_float() && t.bits() == 64) {
+            return has_feature(Target::CLDoubles);
+        }
+    }
+
+    return true;
+}
+
 bool Target::supports_device_api(DeviceAPI api) const {
     switch (api) {
     case DeviceAPI::None:        return true;
@@ -527,7 +576,7 @@ Target::Feature target_feature_for_device_api(DeviceAPI api) {
 
 namespace Internal {
 
-EXPORT void target_test() {
+void target_test() {
     Target t;
     for (const auto &feature : feature_name_map) {
         t.set_feature(feature.second);
@@ -539,7 +588,6 @@ EXPORT void target_test() {
     std::cout << "Target test passed" << std::endl;
 }
 
+}  // namespace Internal
 
-}
-
-}
+}  // namespace Halide

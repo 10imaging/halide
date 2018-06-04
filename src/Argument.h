@@ -6,10 +6,10 @@
  * generated halide pipeline
  */
 
+#include "Buffer.h"
 #include "Error.h"
 #include "Expr.h"
 #include "Type.h"
-#include "Buffer.h"
 #include "runtime/HalideRuntime.h"
 
 namespace Halide {
@@ -95,9 +95,9 @@ struct Argument {
                def.same_as(rhs.def) &&
                min.same_as(rhs.min) &&
                max.same_as(rhs.max);
-    }    
+    }
 };
 
-}
+}  // namespace Halide
 
 #endif

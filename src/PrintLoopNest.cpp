@@ -1,10 +1,9 @@
 #include "PrintLoopNest.h"
-#include "DeepCopy.h"
 #include "FindCalls.h"
-#include "Function.h"
 #include "Func.h"
-#include "RealizationOrder.h"
+#include "Function.h"
 #include "IRPrinter.h"
+#include "RealizationOrder.h"
 #include "ScheduleFunctions.h"
 #include "Simplify.h"
 #include "SimplifySpecializations.h"
@@ -16,9 +15,9 @@
 namespace Halide {
 namespace Internal {
 
+using std::map;
 using std::string;
 using std::vector;
-using std::map;
 
 class PrintLoopNest : public IRVisitor {
 public:
@@ -158,8 +157,7 @@ string print_loop_nest(const vector<Function> &output_funcs) {
     // Compute an environment
     map<string, Function> env;
     for (Function f : output_funcs) {
-        map<string, Function> more_funcs = find_transitive_calls(f);
-        env.insert(more_funcs.begin(), more_funcs.end());
+        populate_environment(f, env);
     }
 
     // Create a deep-copy of the entire graph of Funcs.
@@ -171,11 +169,19 @@ string print_loop_nest(const vector<Function> &output_funcs) {
         Func(f).compute_root().store_root();
     }
 
+    // Finalize all the LoopLevels
+    for (auto &iter : env) {
+        iter.second.lock_loop_levels();
+    }
+
     // Substitute in wrapper Funcs
     env = wrap_func_calls(env);
 
-    // Compute a realization order
-    vector<string> order = realization_order(outputs, env);
+    // Compute a realization order and determine group of functions which loops
+    // are to be fused together
+    vector<string> order;
+    vector<vector<string>> fused_groups;
+    std::tie(order, fused_groups) = realization_order(outputs, env);
 
     // Try to simplify the RHS/LHS of a function definition by propagating its
     // specializations' conditions
@@ -190,7 +196,7 @@ string print_loop_nest(const vector<Function> &output_funcs) {
 
     bool any_memoized = false;
     // Schedule the functions.
-    Stmt s = schedule_functions(outputs, order, env, target, any_memoized);
+    Stmt s = schedule_functions(outputs, fused_groups, env, target, any_memoized);
 
     // Now convert that to pseudocode
     std::ostringstream sstr;
@@ -199,5 +205,5 @@ string print_loop_nest(const vector<Function> &output_funcs) {
     return sstr.str();
 }
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide

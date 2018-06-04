@@ -11,13 +11,14 @@
 #include "Debug.h"
 #include "Error.h"
 #include "Float16.h"
-#include "Type.h"
 #include "IntrusivePtr.h"
+#include "Type.h"
 #include "Util.h"
 
 namespace Halide {
 namespace Internal {
 
+class IRMutator2;
 class IRVisitor;
 
 /** All our IR node types get unique IDs for the purposes of RTTI */
@@ -98,10 +99,10 @@ struct IRNode {
 };
 
 template<>
-EXPORT inline RefCount &ref_count<IRNode>(const IRNode *n) {return n->ref_count;}
+inline RefCount &ref_count<IRNode>(const IRNode *t) {return t->ref_count;}
 
 template<>
-EXPORT inline void destroy<IRNode>(const IRNode *n) {delete n;}
+inline void destroy<IRNode>(const IRNode *t) {delete t;}
 
 /** IR nodes are split into expressions and statements. These are
    similar to expressions and statements in C - expressions
@@ -113,12 +114,14 @@ EXPORT inline void destroy<IRNode>(const IRNode *n) {delete n;}
    methods beyond base IR nodes for now. */
 struct BaseStmtNode : public IRNode {
     BaseStmtNode(IRNodeType t) : IRNode(t) {}
+    virtual Stmt mutate_stmt(IRMutator2 *v) const = 0;
 };
 
 /** A base class for expression nodes. They all contain their types
  * (e.g. Int(32), Float(32)) */
 struct BaseExprNode : public IRNode {
     BaseExprNode(IRNodeType t) : IRNode(t) {}
+    virtual Expr mutate_expr(IRMutator2 *v) const = 0;
     Type type;
 };
 
@@ -130,14 +133,16 @@ struct BaseExprNode : public IRNode {
    a concrete instantiation of a unique IRNodeType per class. */
 template<typename T>
 struct ExprNode : public BaseExprNode {
-    EXPORT void accept(IRVisitor *v) const;
+    void accept(IRVisitor *v) const;
+    Expr mutate_expr(IRMutator2 *v) const;
     ExprNode() : BaseExprNode(T::_node_type) {}
     virtual ~ExprNode() {}
 };
 
 template<typename T>
 struct StmtNode : public BaseStmtNode {
-    EXPORT void accept(IRVisitor *v) const;
+    void accept(IRVisitor *v) const;
+    Stmt mutate_stmt(IRMutator2 *v) const;
     StmtNode() : BaseStmtNode(T::_node_type) {}
     virtual ~StmtNode() {}
 };
@@ -183,8 +188,11 @@ struct IntImm : public ExprNode<IntImm> {
         internal_assert(t.bits() == 8 || t.bits() == 16 || t.bits() == 32 || t.bits() == 64)
             << "IntImm must be 8, 16, 32, or 64-bit\n";
 
-        // Normalize the value by dropping the high bits
-        value <<= (64 - t.bits());
+        // Normalize the value by dropping the high bits.
+        // Since left-shift of negative value is UB in C++, cast to uint64 first;
+        // it's unlikely any compilers we care about will misbehave, but UBSan will complain.
+        value = (int64_t) (((uint64_t) value) << (64 - t.bits()));
+
         // Then sign-extending to get them back
         value >>= (64 - t.bits());
 
@@ -277,21 +285,21 @@ struct Expr : public Internal::IRHandle {
 
     /** Make an expression representing numeric constants of various types. */
     // @{
-    EXPORT explicit Expr(int8_t x)    : IRHandle(Internal::IntImm::make(Int(8), x)) {}
-    EXPORT explicit Expr(int16_t x)   : IRHandle(Internal::IntImm::make(Int(16), x)) {}
-    EXPORT          Expr(int32_t x)   : IRHandle(Internal::IntImm::make(Int(32), x)) {}
-    EXPORT explicit Expr(int64_t x)   : IRHandle(Internal::IntImm::make(Int(64), x)) {}
-    EXPORT explicit Expr(uint8_t x)   : IRHandle(Internal::UIntImm::make(UInt(8), x)) {}
-    EXPORT explicit Expr(uint16_t x)  : IRHandle(Internal::UIntImm::make(UInt(16), x)) {}
-    EXPORT explicit Expr(uint32_t x)  : IRHandle(Internal::UIntImm::make(UInt(32), x)) {}
-    EXPORT explicit Expr(uint64_t x)  : IRHandle(Internal::UIntImm::make(UInt(64), x)) {}
-    EXPORT          Expr(float16_t x) : IRHandle(Internal::FloatImm::make(Float(16), (double)x)) {}
-    EXPORT          Expr(float x)     : IRHandle(Internal::FloatImm::make(Float(32), x)) {}
-    EXPORT explicit Expr(double x)    : IRHandle(Internal::FloatImm::make(Float(64), x)) {}
+    explicit Expr(int8_t x)    : IRHandle(Internal::IntImm::make(Int(8), x)) {}
+    explicit Expr(int16_t x)   : IRHandle(Internal::IntImm::make(Int(16), x)) {}
+             Expr(int32_t x)   : IRHandle(Internal::IntImm::make(Int(32), x)) {}
+    explicit Expr(int64_t x)   : IRHandle(Internal::IntImm::make(Int(64), x)) {}
+    explicit Expr(uint8_t x)   : IRHandle(Internal::UIntImm::make(UInt(8), x)) {}
+    explicit Expr(uint16_t x)  : IRHandle(Internal::UIntImm::make(UInt(16), x)) {}
+    explicit Expr(uint32_t x)  : IRHandle(Internal::UIntImm::make(UInt(32), x)) {}
+    explicit Expr(uint64_t x)  : IRHandle(Internal::UIntImm::make(UInt(64), x)) {}
+             Expr(float16_t x) : IRHandle(Internal::FloatImm::make(Float(16), (double)x)) {}
+             Expr(float x)     : IRHandle(Internal::FloatImm::make(Float(32), x)) {}
+    explicit Expr(double x)    : IRHandle(Internal::FloatImm::make(Float(64), x)) {}
     // @}
 
     /** Make an expression representing a const string (i.e. a StringImm) */
-    EXPORT          Expr(const std::string &s) : IRHandle(Internal::StringImm::make(s)) {}
+             Expr(const std::string &s) : IRHandle(Internal::StringImm::make(s)) {}
 
     /** Get the type of this expression node */
     Type type() const {
@@ -333,17 +341,52 @@ const DeviceAPI all_device_apis[] = {DeviceAPI::None,
                                      DeviceAPI::Metal,
                                      DeviceAPI::Hexagon};
 
+/** An enum describing different address spaces to be used with Func::store_in. */
+enum class MemoryType {
+    /** Let Halide select a storage type automatically */
+    Auto,
+
+    /** Heap/global memory. Allocated using halide_malloc, or
+     * halide_device_malloc */
+    Heap,
+
+    /** Stack memory. Allocated using alloca. Requires a constant
+     * size. Corresponds to per-thread local memory on the GPU. If all
+     * accesses are at constant coordinates, may be promoted into the
+     * register file at the discretion of the register allocator. */
+    Stack,
+
+    /** Register memory. The allocation should be promoted into the
+     * register file. All stores must be at constant coordinates. May
+     * be spilled to the stack at the discretion of the register
+     * allocator. */
+    Register,
+
+    /** Allocation is stored in GPU shared memory. Also known as
+     * "local" in OpenCL, and "threadgroup" in metal. Can be shared
+     * across GPU threads within the same block. */
+    GPUShared,
+};
+
 namespace Internal {
 
-/** An enum describing a type of loop traversal. Used in schedules, and in
- * the For loop IR node. GPUBlock and GPUThread are implicitly parallel */
+/** An enum describing a type of loop traversal. Used in schedules,
+ * and in the For loop IR node. Serial is a conventional ordered for
+ * loop. Iterations occur in increasing order, and each iteration must
+ * appear to have finished before the next begins. Parallel, GPUBlock,
+ * and GPUThread are parallel and unordered: iterations may occur in
+ * any order, and multiple iterations may occur
+ * simultaneously. Vectorized and GPULane are parallel and
+ * synchronous: they act as if all iterations occur at the same time
+ * in lockstep. */
 enum class ForType {
     Serial,
     Parallel,
     Vectorized,
     Unrolled,
     GPUBlock,
-    GPUThread
+    GPUThread,
+    GPULane
 };
 
 

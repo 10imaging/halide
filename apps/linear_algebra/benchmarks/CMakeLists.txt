@@ -6,44 +6,43 @@
 #   some benchmarks will have inconsitent timings (sscal dscal)
 option(LINEAR_ALGEBRA_USE_MATH_FLAGS "Set FTZ/DAZ math flags on all linear_algebra benchmarks" ON)
 if (LINEAR_ALGEBRA_USE_MATH_FLAGS)
-	include (CheckCXXSourceRuns)
-	CHECK_CXX_SOURCE_RUNS(
-		"#include <xmmintrin.h>
-		#include <pmmintrin.h>
-		int main()
-		{
-			// Flush denormals to zero (the FTZ flag).
-			_MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-			// Interpret denormal inputs as zero (the DAZ flag).
-			_MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
-			return 0;
-		}" CAN_ENABLE_FTZ_DAZ)
-	if (CAN_ENABLE_FTZ_DAZ)
-		# explicitly set Flush-To-Zero (FTZ) and Denormals-Are-Zero (DAZ) flags
+  include (CheckCXXSourceRuns)
+  CHECK_CXX_SOURCE_RUNS(
+    "#include <xmmintrin.h>
+    #include <pmmintrin.h>
+    int main()
+    {
+      // Flush denormals to zero (the FTZ flag).
+      _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+      // Interpret denormal inputs as zero (the DAZ flag).
+      _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+      return 0;
+    }" CAN_ENABLE_FTZ_DAZ)
+  if (CAN_ENABLE_FTZ_DAZ)
+    # explicitly set Flush-To-Zero (FTZ) and Denormals-Are-Zero (DAZ) flags
     # this definition affects macros.h
-		set(MISC_DEFINITIONS -DENABLE_FTZ_DAZ)
-	endif()
-	message(STATUS "Setting FTZ/DAZ math flags in linear_algebra benchmarks")
+    set(MISC_DEFINITIONS -DENABLE_FTZ_DAZ)
+  endif()
 else()
-	message(STATUS "Not setting FTZ/DAZ math flags in linear_algebra benchmarks")
+  # Due to slowdowns, this merits a warning rather than merely a status
+  message(WARNING "linear_algebra: Not setting FTZ/DAZ math flags in benchmarks")
 endif()
 
 add_executable(halide_benchmarks halide_benchmarks.cpp)
 target_include_directories(halide_benchmarks PRIVATE ${halide_blas_INCLUDE_DIRS})
 target_compile_definitions(halide_benchmarks PRIVATE -DUSE_HALIDE ${MISC_DEFINITIONS})
-target_compile_options(halide_benchmarks PRIVATE -std=c++11)
 target_link_libraries(halide_benchmarks PRIVATE halide_blas)
 list(APPEND BLAS_NAMES halide)
 
-message(STATUS "Checking for Eigen")
-find_package(Eigen3)
-if (Eigen3_FOUND)
-  message(STATUS " Found")
+find_package(Eigen3 QUIET)
+if (NOT Eigen3_FOUND)
+  message(STATUS "linear_algebra: Eigen3 Missing, skipping Eigen3 benchmarks")
+else()
   add_executable(eigen_benchmarks
     eigen_benchmarks.cpp
   )
   target_compile_definitions(eigen_benchmarks PRIVATE -DEIGEN_DONT_PARALLELIZE ${MISC_DEFINITIONS})
-  target_compile_options(eigen_benchmarks PRIVATE -std=c++11 -Wno-error=unused-variable)
+  target_compile_options(eigen_benchmarks PRIVATE -Wno-error=unused-variable)
   target_link_libraries(eigen_benchmarks
     PRIVATE
       Eigen3::Eigen
@@ -52,34 +51,36 @@ if (Eigen3_FOUND)
 endif()
 
 if (NOT CBLAS_FOUND)
-  message(WARNING "No CBLAS header, skipping BLAS benchmarks")
+  message(STATUS "linear_algebra: No CBLAS header, skipping BLAS benchmarks")
 else()
   foreach(BLAS_VENDOR ${BLAS_VENDORS})
-    string(TOLOWER ${BLAS_VENDOR} NAME)
-    set(TARGET ${NAME}_benchmarks)
-    add_executable(${TARGET}
-      cblas_benchmarks.cpp
-    )
-    target_include_directories(${TARGET} SYSTEM
-      PRIVATE
-       ${CBLAS_INCLUDE_DIR}
-    )
-    string(TOUPPER ${BLAS_VENDOR} DEFINE_SUFFIX)
-    target_compile_definitions(${TARGET} PRIVATE -DUSE_${DEFINE_SUFFIX} ${MISC_DEFINITIONS})
-    target_compile_options(${TARGET} PRIVATE -std=c++11 -Wno-error=unused-variable)
-    target_link_libraries(${TARGET}
-      PRIVATE
-       ${BLAS_${NAME}_LIBRARY}
-       ${${BLAS_VENDOR}_EXTRA_LIBS}
+    set(BLA_VENDOR ${BLAS_VENDOR})
+    set(BLAS_FIND_QUIETLY true)
+    find_package(BLAS)
+    if (NOT BLAS_FOUND)
+      message(STATUS "linear_algebra: ${BLAS_VENDOR} Missing, skipping ${BLAS_VENDOR} benchmarks")
+    else()
+      string(TOLOWER ${BLAS_VENDOR} NAME)
+      set(TARGET ${NAME}_benchmarks)
+      add_executable(${TARGET}
+        cblas_benchmarks.cpp
       )
-    list(APPEND BLAS_NAMES ${NAME})
+      target_include_directories(${TARGET} SYSTEM
+        PRIVATE
+         ${CBLAS_INCLUDE_DIR}
+      )
+      string(TOUPPER ${BLAS_VENDOR} DEFINE_SUFFIX)
+      target_compile_definitions(${TARGET} PRIVATE -DUSE_${DEFINE_SUFFIX} ${MISC_DEFINITIONS})
+      target_compile_options(${TARGET} PRIVATE -Wno-error=unused-variable)
+      target_link_libraries(${TARGET}
+        PRIVATE
+         ${BLAS_${NAME}_LIBRARY}
+         ${${BLAS_VENDOR}_EXTRA_LIBS}
+        )
+      list(APPEND BLAS_NAMES ${NAME})
+    endif()
   endforeach()
 endif()
-
-message(STATUS "Building Benchmarks")
-foreach(BLAS ${BLAS_NAMES})
-  message(STATUS " ${BLAS}")
-endforeach()
 
 # Large powers of two are a pathological case for the cache, so avoid
 # them for the benchmarks.

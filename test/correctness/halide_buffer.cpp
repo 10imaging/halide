@@ -26,8 +26,6 @@ void check_equal(const Buffer<T1> &a, const Buffer<T2> &b) {
     });
 }
 
-
-
 int main(int argc, char **argv) {
     {
         // Check copying a buffer
@@ -37,6 +35,8 @@ int main(int argc, char **argv) {
         a.transpose(1, 2);
 
         a.fill(1.0f);
+
+        assert(a.all_equal(1.0f));
 
         b.fill([&](int x, int y, int c) {
             return x + 100.0f * y + 100000.0f * c;
@@ -126,6 +126,45 @@ int main(int argc, char **argv) {
                 abort();
             }
         });
+    }
+
+    {
+        // Check that copy() works to/from Buffer<void>
+        Buffer<int> a(2, 2);
+        a.fill(42);
+
+        Buffer<> b = a.copy();
+        assert(b.as<int>().all_equal(42));
+
+        Buffer<int> c = b.copy();
+        assert(c.all_equal(42));
+
+        // This will fail at runtime, as c and d do not have identical types
+        // Buffer<uint8_t> d = c.copy();
+        // assert(d.all_equal(42));
+    }
+
+    {
+        int data[4] = { 42, 42, 42, 42 };
+
+        // Check that copy() works with const
+        Buffer<const int> a(data, 2, 2);
+
+        Buffer<const int> b = a.copy();
+        assert(b.all_equal(42));
+    }
+
+    {
+        // Check the fields get zero-initialized with the default constructor.
+        uint8_t buf[sizeof(Halide::Runtime::Buffer<float>)];
+        memset(&buf, 1, sizeof(buf));
+        new (&buf) Halide::Runtime::Buffer<float>();
+        // The dim and type fields should be non-zero, but the other
+        // fields should all be zero. We'll just check the ones after
+        // the halide_buffer_t.
+        for (size_t i = sizeof(halide_buffer_t); i < sizeof(buf); i++) {
+            assert(!buf[i]);
+        }
     }
 
     printf("Success!\n");

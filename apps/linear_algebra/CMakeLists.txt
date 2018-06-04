@@ -12,6 +12,7 @@ find_path(CBLAS_INCLUDE_DIR
     /usr/local/include
     /usr/include/atlas
     /usr/local/include/atlas
+    /usr/local/opt/openblas/include # enables openblas-via-homebrew-on-mac
 )
 set(CBLAS_FOUND false)
 if (NOT CBLAS_INCLUDE_DIR MATCHES "-NOTFOUND")
@@ -46,12 +47,6 @@ if (CBLAS_FOUND)
 endif()
 
 add_subdirectory(src)
-
-# XXX
-# seems like halide_blas needs to be changed or the AOT headers should be
-# marked PUBLIC (since they are referenced by the public interface (halide_blas.h)
-get_target_property(halide_blas_INCLUDE_DIRS halide_blas INCLUDE_DIRECTORIES)
-list(APPEND halide_blas_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 if (WITH_TESTS)
   add_subdirectory(tests)

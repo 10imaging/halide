@@ -1,16 +1,17 @@
 #include "CodeGen_Internal.h"
-#include "IROperator.h"
-#include "IRMutator.h"
 #include "CSE.h"
 #include "Debug.h"
+#include "IRMutator.h"
+#include "IROperator.h"
+#include "LLVM_Headers.h"
 
 namespace Halide {
 namespace Internal {
 
-using std::string;
 using std::map;
-using std::vector;
 using std::pair;
+using std::string;
+using std::vector;
 
 using namespace llvm;
 
@@ -138,6 +139,7 @@ llvm::Type *llvm_type_of(LLVMContext *c, Halide::Type t) {
 // functions that takes a user_context pointer as its first parameter.
 bool function_takes_user_context(const std::string &name) {
     static const char *user_context_runtime_funcs[] = {
+        "halide_buffer_copy",
         "halide_copy_to_host",
         "halide_copy_to_device",
         "halide_current_time_ns",
@@ -197,6 +199,9 @@ bool function_takes_user_context(const std::string &name) {
         "halide_upgrade_buffer_t",
         "halide_downgrade_buffer_t",
         "halide_downgrade_buffer_t_device_fields",
+        "_halide_buffer_crop",
+        "_halide_buffer_retire_crop_after_extern_stage",
+        "_halide_buffer_retire_crops_after_extern_stage",
     };
     const int num_funcs = sizeof(user_context_runtime_funcs) /
         sizeof(user_context_runtime_funcs[0]);
@@ -270,11 +275,10 @@ namespace {
 
 // This mutator rewrites predicated loads and stores as unpredicated
 // loads/stores with explicit conditions, scalarizing if necessary.
-class UnpredicateLoadsStores : public IRMutator {
-    void visit(const Load *op) {
+class UnpredicateLoadsStores : public IRMutator2 {
+    Expr visit(const Load *op) override {
         if (is_one(op->predicate)) {
-            IRMutator::visit(op);
-            return;
+            return IRMutator2::visit(op);
         }
 
         Expr predicate = mutate(op->predicate);
@@ -284,7 +288,7 @@ class UnpredicateLoadsStores : public IRMutator {
         if (const Broadcast *scalar_pred = predicate.as<Broadcast>()) {
             Expr unpredicated_load = Load::make(op->type, op->name, index, op->image, op->param,
                                                 const_true(op->type.lanes()));
-            expr = Call::make(op->type, Call::if_then_else, {scalar_pred->value, unpredicated_load, make_zero(op->type)},
+            return Call::make(op->type, Call::if_then_else, {scalar_pred->value, unpredicated_load, make_zero(op->type)},
                               Call::PureIntrinsic);
         } else {
             string index_name = "scalarized_load_index";
@@ -303,16 +307,15 @@ class UnpredicateLoadsStores : public IRMutator {
                                 make_zero(unpredicated_load.type())}, Call::PureIntrinsic));
                 ramp.push_back(i);
             }
-            expr = Shuffle::make(lanes, ramp);
+            Expr expr = Shuffle::make(lanes, ramp);
             expr = Let::make(predicate_name, predicate, expr);
-            expr = Let::make(index_name, index, expr);
+            return Let::make(index_name, index, expr);
         }
     }
 
-    void visit(const Store *op) {
+    Stmt visit(const Store *op) override {
         if (is_one(op->predicate)) {
-            IRMutator::visit(op);
-            return;
+            return IRMutator2::visit(op);
         }
 
         Expr predicate = mutate(op->predicate);
@@ -321,7 +324,7 @@ class UnpredicateLoadsStores : public IRMutator {
 
         if (const Broadcast *scalar_pred = predicate.as<Broadcast>()) {
             Stmt unpredicated_store = Store::make(op->name, value, index, op->param, const_true(value.type().lanes()));
-            stmt = IfThenElse::make(scalar_pred->value, unpredicated_store);
+            return IfThenElse::make(scalar_pred->value, unpredicated_store);
         } else {
             string value_name = "scalarized_store_value";
             Expr value_var = Variable::make(value.type(), value_name);
@@ -338,14 +341,14 @@ class UnpredicateLoadsStores : public IRMutator {
                 Stmt lane = IfThenElse::make(pred_i, Store::make(op->name, value_i, index_i, op->param, const_true()));
                 lanes.push_back(lane);
             }
-            stmt = Block::make(lanes);
+            Stmt stmt = Block::make(lanes);
             stmt = LetStmt::make(predicate_name, predicate, stmt);
             stmt = LetStmt::make(value_name, value, stmt);
-            stmt = LetStmt::make(index_name, index, stmt);
+            return LetStmt::make(index_name, index, stmt);
        }
     }
 
-    using IRMutator::visit;
+    using IRMutator2::visit;
 };
 
 }  // namespace
@@ -389,23 +392,18 @@ void get_target_options(const llvm::Module &module, llvm::TargetOptions &options
     get_md_string(module.getModuleFlag("halide_mcpu"), mcpu);
     get_md_string(module.getModuleFlag("halide_mattrs"), mattrs);
 
+    bool per_instruction_fast_math_flags = false;
+    get_md_bool(module.getModuleFlag("halide_per_instruction_fast_math_flags"), per_instruction_fast_math_flags);
+
     options = llvm::TargetOptions();
     #if LLVM_VERSION < 50
-    options.LessPreciseFPMADOption = true;
+    options.LessPreciseFPMADOption = !per_instruction_fast_math_flags;
     #endif
-    options.AllowFPOpFusion = llvm::FPOpFusion::Fast;
-    options.UnsafeFPMath = true;
-
-    #if LLVM_VERSION < 40
-    // Turn off approximate reciprocals for division. It's too
-    // inaccurate even for us. In LLVM 4.0+ this moved to be a
-    // function attribute.
-    options.Reciprocals.setDefaults("all", false, 0);
-    #endif
-
-    options.NoInfsFPMath = true;
-    options.NoNaNsFPMath = true;
-    options.HonorSignDependentRoundingFPMathOption = false;
+    options.AllowFPOpFusion = per_instruction_fast_math_flags ? llvm::FPOpFusion::Strict : llvm::FPOpFusion::Fast;
+    options.UnsafeFPMath = !per_instruction_fast_math_flags;
+    options.NoInfsFPMath = !per_instruction_fast_math_flags;
+    options.NoNaNsFPMath = !per_instruction_fast_math_flags;
+    options.HonorSignDependentRoundingFPMathOption = !per_instruction_fast_math_flags;
     options.NoZerosInBSS = false;
     options.GuaranteedTailCallOpt = false;
     options.StackAlignmentOverride = 0;
@@ -413,10 +411,7 @@ void get_target_options(const llvm::Module &module, llvm::TargetOptions &options
     options.UseInitArray = false;
     options.FloatABIType =
         use_soft_float_abi ? llvm::FloatABI::Soft : llvm::FloatABI::Hard;
-    #if LLVM_VERSION >= 39
-    // Not supported by older linkers
     options.RelaxELFRelocations = false;
-    #endif
 }
 
 
@@ -444,37 +439,39 @@ void clone_target_options(const llvm::Module &from, llvm::Module &to) {
 std::unique_ptr<llvm::TargetMachine> make_target_machine(const llvm::Module &module) {
     std::string error_string;
 
-    const llvm::Target *target = llvm::TargetRegistry::lookupTarget(module.getTargetTriple(), error_string);
-    if (!target) {
+    const llvm::Target *llvm_target = llvm::TargetRegistry::lookupTarget(module.getTargetTriple(), error_string);
+    if (!llvm_target) {
         std::cout << error_string << std::endl;
-#if LLVM_VERSION < 50
+#if LLVM_VERSION < 60
         llvm::TargetRegistry::printRegisteredTargetsForVersion();
 #else
         llvm::TargetRegistry::printRegisteredTargetsForVersion(llvm::outs());
 #endif
     }
-    internal_assert(target) << "Could not create target for " << module.getTargetTriple() << "\n";
+    internal_assert(llvm_target) << "Could not create LLVM target for " << module.getTargetTriple() << "\n";
 
     llvm::TargetOptions options;
     std::string mcpu = "";
     std::string mattrs = "";
     get_target_options(module, options, mcpu, mattrs);
 
-    return std::unique_ptr<llvm::TargetMachine>(target->createTargetMachine(module.getTargetTriple(),
+    return std::unique_ptr<llvm::TargetMachine>(llvm_target->createTargetMachine(module.getTargetTriple(),
                                                 mcpu, mattrs,
                                                 options,
                                                 llvm::Reloc::PIC_,
+#if LLVM_VERSION < 60
                                                 llvm::CodeModel::Default,
+#else
+                                                llvm::CodeModel::Small,
+#endif
                                                 llvm::CodeGenOpt::Aggressive));
 }
 
 void set_function_attributes_for_target(llvm::Function *fn, Target t) {
-    #if LLVM_VERSION >= 40
     // Turn off approximate reciprocals for division. It's too
     // inaccurate even for us.
     fn->addFnAttr("reciprocal-estimates", "none");
-    #endif
 }
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide

@@ -1,30 +1,32 @@
 #include <iostream>
-#include <sstream>
 #include <mutex>
+#include <sstream>
 
-#include "LLVM_Headers.h"
-#include "CodeGen_Hexagon.h"
-#include "CodeGen_Internal.h"
-#include "IROperator.h"
-#include "IRMatch.h"
-#include "IREquality.h"
-#include "IRMutator.h"
-#include "Target.h"
-#include "Debug.h"
-#include "Util.h"
-#include "Simplify.h"
-#include "IRPrinter.h"
-#include "EliminateBoolVectors.h"
-#include "HexagonOptimize.h"
 #include "AlignLoads.h"
 #include "CSE.h"
+#include "CodeGen_Hexagon.h"
+#include "CodeGen_Internal.h"
+#include "Debug.h"
+#include "EliminateBoolVectors.h"
+#include "HexagonOptimize.h"
+#include "IREquality.h"
+#include "IRMatch.h"
+#include "IRMutator.h"
+#include "IROperator.h"
+#include "IRPrinter.h"
+#include "LICM.h"
+#include "LLVM_Headers.h"
 #include "LoopCarry.h"
+#include "Simplify.h"
+#include "Substitute.h"
+#include "Target.h"
+#include "Util.h"
 
 namespace Halide {
 namespace Internal {
 
-using std::vector;
 using std::string;
+using std::vector;
 
 using namespace llvm;
 
@@ -35,9 +37,6 @@ using namespace llvm;
 // avoid needing to #ifdef random patches of code, we just replace all LLVM intrinsics
 // with not_intrinsic.
 #ifdef WITH_HEXAGON
-#if LLVM_VERSION < 39
-#error "Hexagon target requires LLVM version 3.9 or later."
-#endif
 
 #define IPICK(is_128B, i64) (is_128B ? i64##_128B : i64)
 #else
@@ -92,46 +91,29 @@ std::unique_ptr<llvm::Module> CodeGen_Hexagon::compile(const Module &module) {
 
 namespace {
 
-// A piece of IR uses HVX if it contains any vector type producing IR
-// nodes.
-class UsesHvx : public IRVisitor {
-private:
-    using IRVisitor::visit;
-    void visit(const Variable *op) {
-        uses_hvx = uses_hvx || op->type.is_vector();
-    }
-    void visit(const Ramp *op) {
-        uses_hvx = uses_hvx || op->type.is_vector();
-    }
-    void visit(const Broadcast *op) {
-        uses_hvx = uses_hvx || op->lanes > 1;
-    }
-    void visit(const Call *op) {
-        uses_hvx = uses_hvx || op->type.is_vector();
-    }
-
-public:
-    bool uses_hvx = false;
-};
-
-bool uses_hvx(Stmt s) {
-    UsesHvx uses;
-    s.accept(&uses);
-    return uses.uses_hvx;
-}
-
-// Wrap the stmt in a call to qurt_hvx_lock, calling qurt_hvx_unlock
-// as a destructor if successful.
-Stmt acquire_hvx_context(Stmt stmt, const Target &target) {
-    // Modify the stmt to add a call to halide_qurt_hvx_lock, and
-    // register a destructor to call halide_qurt_hvx_unlock.
+Stmt call_halide_qurt_hvx_lock(const Target &target) {
     Expr hvx_mode = target.has_feature(Target::HVX_128) ? 128 : 64;
     Expr hvx_lock = Call::make(Int(32), "halide_qurt_hvx_lock", {hvx_mode}, Call::Extern);
     string hvx_lock_result_name = unique_name("hvx_lock_result");
     Expr hvx_lock_result_var = Variable::make(Int(32), hvx_lock_result_name);
     Stmt check_hvx_lock = LetStmt::make(hvx_lock_result_name, hvx_lock,
                                         AssertStmt::make(EQ::make(hvx_lock_result_var, 0), hvx_lock_result_var));
-
+    return check_hvx_lock;
+}
+Stmt call_halide_qurt_hvx_unlock() {
+    Expr hvx_unlock = Call::make(Int(32), "halide_qurt_hvx_unlock", {}, Call::Extern);
+    string hvx_unlock_result_name = unique_name("hvx_unlock_result");
+    Expr hvx_unlock_result_var = Variable::make(Int(32), hvx_unlock_result_name);
+    Stmt check_hvx_unlock = LetStmt::make(hvx_unlock_result_name, hvx_unlock,
+                                          AssertStmt::make(EQ::make(hvx_unlock_result_var, 0), hvx_unlock_result_var));
+    return check_hvx_unlock;
+}
+// Wrap the stmt in a call to qurt_hvx_lock, calling qurt_hvx_unlock
+// as a destructor if successful.
+Stmt acquire_hvx_context(Stmt stmt, const Target &target) {
+    // Modify the stmt to add a call to halide_qurt_hvx_lock, and
+    // register a destructor to call halide_qurt_hvx_unlock.
+    Stmt check_hvx_lock = call_halide_qurt_hvx_lock(target);
     Expr dummy_obj = reinterpret(Handle(), cast<uint64_t>(1));
     Expr hvx_unlock = Call::make(Int(32), Call::register_destructor,
                                  {Expr("halide_qurt_hvx_unlock_as_destructor"), dummy_obj}, Call::Intrinsic);
@@ -140,7 +122,6 @@ Stmt acquire_hvx_context(Stmt stmt, const Target &target) {
     stmt = Block::make(check_hvx_lock, stmt);
     return stmt;
 }
-
 bool is_dense_ramp(Expr x) {
     const Ramp *r = x.as<Ramp>();
     if (!r) return false;
@@ -151,12 +132,11 @@ bool is_dense_ramp(Expr x) {
 // In Hexagon, we assume that we can read one vector past the end of
 // buffers. Using this assumption, this mutator replaces vector
 // predicated dense loads with scalar predicated dense loads.
-class SloppyUnpredicateLoads : public IRMutator {
-    void visit(const Load *op) {
+class SloppyUnpredicateLoads : public IRMutator2 {
+    Expr visit(const Load *op) override {
         // Don't handle loads with without predicates, scalar predicates, or non-dense ramps.
         if (is_one(op->predicate) || op->predicate.as<Broadcast>() || !is_dense_ramp(op->index)) {
-            IRMutator::visit(op);
-            return;
+            return IRMutator2::visit(op);
         }
 
         Expr predicate = mutate(op->predicate);
@@ -169,14 +149,140 @@ class SloppyUnpredicateLoads : public IRMutator {
         }
         predicate = Broadcast::make(condition, predicate.type().lanes());
 
-        expr = Load::make(op->type, op->name, index, op->image, op->param, predicate);
+        return Load::make(op->type, op->name, index, op->image, op->param, predicate);
     }
 
-    using IRMutator::visit;
+    using IRMutator2::visit;
 };
 
 Stmt sloppy_unpredicate_loads(Stmt s) {
     return SloppyUnpredicateLoads().mutate(s);
+}
+
+class InjectHVXLocks : public IRMutator2 {
+public:
+    InjectHVXLocks(const Target &t) : target(t) {
+        uses_hvx_var = Variable::make(Bool(), "uses_hvx");
+    }
+    bool uses_hvx = false;
+private:
+    Expr uses_hvx_var;
+    using IRMutator2::visit;
+    // Primarily, we do two things when we encounter a parallel for loop.
+    // First, we check if the paralell for loop uses_hvx and accordingly
+    // acqure_hvx_context i.e. acquire and release HVX locks.
+    // Then we insert a conditional unlock before the for loop, let's call
+    // this the prolog, and a conditional lock after the for loop which
+    // we shall call the epilog. So the code for a parallel loop that uses
+    // hvx should look like so.
+    //
+    // if (uses_hvx_var) {
+    //     halide_qurt_hvx_unlock();
+    // }
+    // parallel_for {
+    //     halide_qurt_hvx_lock();
+    //     ...
+    //     ...
+    //     halide_qurt_hvx_unlock();
+    // }
+    // if (uses_hvx_var) {
+    //     halide_qurt_hvx_lock();
+    // }
+    //
+    // When we move up to the enclosing scope we substitute the value of uses_hvx
+    // into the IR that should convert the conditionals to constants.
+    Stmt visit(const For *op) {
+        if (op->for_type == ForType::Parallel) {
+            bool old_uses_hvx = uses_hvx;
+            uses_hvx = false;
+
+            Stmt body = mutate(op->body);
+            Stmt s;
+            if (uses_hvx) {
+                body = acquire_hvx_context(body, target);
+                body = substitute("uses_hvx", true, body);
+                Stmt new_for = For::make(op->name, op->min, op->extent,
+                                         op->for_type, op->device_api, body);
+                Stmt prolog = IfThenElse::make(uses_hvx_var,
+                                               call_halide_qurt_hvx_unlock());
+                Stmt epilog = IfThenElse::make(uses_hvx_var,
+                                               call_halide_qurt_hvx_lock(target));
+                s = Block::make({prolog, new_for, epilog});
+                debug(4) << "Wrapping prolog & epilog around par loop\n" << s << "\n";
+            } else {
+                // We do not substitute false for "uses_hvx" into the body as we do in the true
+                // case because we want to defer that to an enclosing scope. The logic is that
+                // in case this scope doesn't use_hvx (we are here in the else because of that)
+                // then an enclosing scope might. However, substituting false for "uses_hvx"
+                // at this stage will remove the prolog and epilog checks that will be needed
+                // as the enclosing scope uses hvx. This is exhibited by the following code
+                // structure
+                //
+                // for_par(z..) {//uses hvx
+                //   for_par(y..) {  // doesn't use hvx
+                //     for_par(x..) { // uses hvx
+                //        vector code
+                //     }
+                //   }
+                //   vector code
+                // }
+                // If we substitute false in the else here, we'll get
+                // for_par(z.) {
+                //   halide_qurt_hvx_lock();
+                //   for_par(y..) {
+                //     if (false) {
+                //        halide_qurt_hvx_unlock(); // will get optimized away.
+                //     }
+                //     for_par(x..) {
+                //        halide_qurt_hvx_lock();  // double lock. Not good.
+                //        vector code
+                //        halide_qurt_hvx_unlock();
+                //     }
+                //     if (false) {
+                //        halide_qurt_hvx_lock();
+                //     }
+                //   }
+                //   vector code
+                //   halide_qurt_unlock
+                // }
+                s = For::make(op->name, op->min, op->extent, op->for_type, op->device_api, body);
+            }
+
+            uses_hvx = old_uses_hvx;
+            return s;
+
+        }
+        return IRMutator2::visit(op);
+    }
+    Expr visit(const Variable *op) {
+        uses_hvx = uses_hvx || op->type.is_vector();
+        return op;
+    }
+    Expr visit(const Ramp *op) {
+        uses_hvx = uses_hvx || op->type.is_vector();
+        return op;
+    }
+    Expr visit(const Broadcast *op) {
+        uses_hvx = uses_hvx || op->lanes > 1;
+        return op;
+    }
+    Expr visit(const Call *op) {
+        uses_hvx = uses_hvx || op->type.is_vector();
+        return op;
+    }
+
+    Target target;
+};
+
+Stmt inject_hvx_lock_unlock(Stmt body, const Target &target) {
+    InjectHVXLocks i(target);
+    body = i.mutate(body);
+    if (i.uses_hvx) {
+        body = acquire_hvx_context(body, target);
+    }
+    body = substitute("uses_hvx", i.uses_hvx, body);
+    body = simplify(body);
+    return body;
 }
 
 }// namespace
@@ -210,7 +316,7 @@ void CodeGen_Hexagon::compile_func(const LoweredFunc &f,
     #endif
 
     debug(1) << "Aligning loads for HVX....\n";
-    body = align_loads(body, target.natural_vector_size(Int(8)));
+    body = align_loads(body, target.natural_vector_size(Int(8)), alignment_info);
     body = common_subexpression_elimination(body);
     // Don't simplify here, otherwise it will re-collapse the loads we
     // want to carry across loop iterations.
@@ -231,10 +337,8 @@ void CodeGen_Hexagon::compile_func(const LoweredFunc &f,
     debug(1) << "Optimizing Hexagon instructions...\n";
     body = optimize_hexagon_instructions(body, target);
 
-    if (uses_hvx(body)) {
-        debug(1) << "Adding calls to qurt_hvx_lock...\n";
-        body = acquire_hvx_context(body, target);
-    }
+    debug(1) << "Adding calls to qurt_hvx_lock, if necessary...\n";
+    body = inject_hvx_lock_unlock(body, target);
 
     debug(1) << "Hexagon function body:\n";
     debug(1) << body << "\n";
@@ -756,21 +860,17 @@ Value *CodeGen_Hexagon::interleave_vectors(const vector<llvm::Value *> &v) {
         }
     } else if (v.size() == 3) {
         // Interleaving 3 vectors - this generates awful code if we let LLVM do it,
-        // so we use vlut if we can. This is actually pretty general, it might be
-        // useful for other interleavings, though the LUT grows impractically
-        // large quite quickly.
-        if (element_bits == 8 || element_bits == 16) {
-            Value *lut = concat_vectors(v);
+        // so we use vdelta.
+        Value *lut = concat_vectors(v);
 
-            std::vector<int> indices;
-            for (unsigned i = 0; i < v_ty->getVectorNumElements(); i++) {
-                for (size_t j = 0; j < v.size(); j++) {
-                    indices.push_back(j * v_ty->getVectorNumElements() + i);
-                }
+        std::vector<int> indices;
+        for (unsigned i = 0; i < v_ty->getVectorNumElements(); i++) {
+            for (size_t j = 0; j < v.size(); j++) {
+                indices.push_back(j * v_ty->getVectorNumElements() + i);
             }
-
-            return vlut(lut, indices);
         }
+
+        return vdelta(lut, indices);
     }
     return CodeGen_Posix::interleave_vectors(v);
 }
@@ -911,11 +1011,8 @@ Value *CodeGen_Hexagon::shuffle_vectors(Value *a, Value *b,
         if (is_concat_or_slice(indices) || element_bits > 16) {
             // Let LLVM handle concat or slices.
             return CodeGen_Posix::shuffle_vectors(a, b, indices);
-        } else if (max < 256) {
-            // This is something else and the indices fit in 8 bits, use a vlut.
-            return vlut(concat_vectors({a, b}), indices);
         }
-        return CodeGen_Posix::shuffle_vectors(a, b, indices);
+        return vlut(concat_vectors({a, b}), indices);
     }
 
     if (stride == 1) {
@@ -1002,9 +1099,9 @@ Value *CodeGen_Hexagon::shuffle_vectors(Value *a, Value *b,
     }
 
     // TODO: There are more HVX permute instructions that could be
-    // implemented here.
+    // implemented here, such as vdelta/vrdelta.
 
-    if (element_bits <= 16 && max < 256) {
+    if (element_bits <= 16) {
         return vlut(concat_vectors({a, b}), indices);
     } else {
         return CodeGen_Posix::shuffle_vectors(a, b, indices);
@@ -1121,6 +1218,202 @@ Value *CodeGen_Hexagon::vlut(Value *lut, Value *idx, int min_index, int max_inde
     }
 
     return slice_vector(concat_vectors(result), 0, idx_elements);
+}
+
+bool is_power_of_two(int x) { return (x & (x - 1)) == 0; }
+
+// vdelta and vrdelta are instructions that take an input vector and
+// pass it through a network made up of levels. Each element x at each
+// level i can either take the element from the previous level at the
+// same position x, or take the element from the previous level at y,
+// where y is x with the bit at position i flipped. This forms a
+// butterfly network. vdelta and vrdelta have the same structure,
+// except the ordering of the levels is flipped.
+
+// Find a descriptor of the path between x1 and x2. To find the path
+// between element x1 and element x2, the algorithm is the same for
+// both vdelta and vrdelta. To get from x1 to x2, we need to take the
+// switch path at level i if bit i of x1 and x2 are not the same. The
+// path is an integer where the bit at position i indicates the switch
+// that jumps by i elements should be on.
+int generate_delta_path(int x1, int x2) {
+    int result = 0;
+    for (int delta = 1; x1 != x2; delta *= 2) {
+        if ((x1 & delta) != (x2 & delta)) {
+            result |= delta;
+        }
+        x1 &= ~delta;
+        x2 &= ~delta;
+    }
+    return result;
+}
+
+// Generate the switch descriptors for a vdelta or vrdelta
+// instruction. To do this, we need to generate the switch descriptors
+// of each output to input path, and then make sure that none of the
+// switches need conflicting settings.
+bool generate_vdelta(const std::vector<int> &indices, bool reverse, std::vector<int> &switches) {
+    int width = (int)indices.size();
+    internal_assert(is_power_of_two(width));
+    switches.resize(width);
+
+    // For each switch bit, we have a bit indicating whether we
+    // already care about the switch position.
+    std::vector<int> switches_used(switches.size());
+    std::fill(switches.begin(), switches.end(), 0);
+    std::fill(switches_used.begin(), switches_used.end(), 0);
+
+    for (int out = 0; out < width; out++) {
+        int in = indices[out];
+        if (in == -1) {
+            // We don't care what the output is at this index.
+            continue;
+        }
+        int path = generate_delta_path(out, in);
+        int x = out;
+        // Follow the path backwards, setting the switches we need as
+        // we go. This is the only place where vdelta and vrdelta
+        // differ. For vdelta, we start with the small jumps, vrdelta
+        // starts with the large jumps.
+        int start = reverse ? (1 << 30) : 1;
+        for (int delta = start; path != 0; delta = reverse ? delta / 2 : delta * 2) {
+            int switch_state = path & delta;
+            if ((switches_used[x] & delta) != 0) {
+                // This switch is already set...
+                if ((switches[x] & delta) != switch_state) {
+                    // ... and it is set to the wrong thing. We can't represent this shuffle.
+                    return false;
+                }
+            } else {
+                // This switch is not already set, set it to the value we want, and mark it used.
+                switches_used[x] |= delta;
+                switches[x] |= switch_state;
+            }
+            // Update our position in the network.
+            if (switch_state) {
+                x ^= delta;
+            }
+            path &= ~delta;
+        }
+    }
+    return true;
+}
+
+Value *CodeGen_Hexagon::vdelta(Value *lut, const vector<int> &indices) {
+    bool is_128B = target.has_feature(Halide::Target::HVX_128);
+    llvm::Type *lut_ty = lut->getType();
+    int lut_elements = lut_ty->getVectorNumElements();
+    llvm::Type *element_ty = lut_ty->getVectorElementType();
+    int element_bits = element_ty->getScalarSizeInBits();
+    int native_elements = native_vector_bits()/element_ty->getScalarSizeInBits();
+    int result_elements = indices.size();
+
+    // If the input is not a vector of 8 bit elements, replicate the
+    // indices and cast the LUT.
+    if (element_bits != 8) {
+        int replicate = element_bits / 8;
+        assert(replicate != 0);
+        llvm::Type *new_lut_ty = llvm::VectorType::get(i8_t, lut_elements * replicate);
+        Value *i8_lut = builder->CreateBitCast(lut, new_lut_ty);
+        vector<int> i8_indices(indices.size() * replicate);
+        for (size_t i = 0; i < indices.size(); i++) {
+            for (int j = 0; j < replicate; j++) {
+                i8_indices[i * replicate + j] = indices[i] * replicate + j;
+            }
+        }
+        Value *result = vdelta(i8_lut, i8_indices);
+        result = builder->CreateBitCast(result, lut_ty);
+        return result;
+    }
+
+    // We can only use vdelta to produce a single native vector at a
+    // time. Break the input into native vector length shuffles.
+    if (result_elements != native_elements) {
+        vector<llvm::Value *> ret;
+        for (int i = 0; i < result_elements; i += native_elements) {
+            vector<int> indices_i(native_elements);
+            for (int j = 0; j < native_elements; j++) {
+                if (i + j < result_elements) {
+                    indices_i[j] = indices[i + j];
+                } else {
+                    indices_i[j] = -1;
+                }
+            }
+            Value *ret_i = vdelta(lut, indices_i);
+            if (result_elements - i < native_elements) {
+                // This was a fractional vector at the end, slice the part we want.
+                ret_i = slice_vector(ret_i, 0, result_elements - i);
+            }
+            ret.push_back(ret_i);
+        }
+        return concat_vectors(ret);
+    }
+
+    assert(result_elements == native_elements);
+
+    // We can only use vdelta to shuffle a single native vector of
+    // input. If we have more than one, we need to break it into
+    // multiple vdelta operations, and combine them with vmux.
+    if (lut_elements != native_elements) {
+        Value *ret = nullptr;
+        for (int i = 0; i < lut_elements; i += native_elements) {
+            Value *lut_i = slice_vector(lut, i, native_elements);
+            vector<int> indices_i(native_elements);
+            vector<Constant *> mask(native_elements);
+            bool all_used = true;
+            bool none_used = true;
+            for (int j = 0; j < native_elements; j++) {
+                int idx = indices[j] - i;
+                if (0 <= idx && idx < native_elements) {
+                    indices_i[j] = idx;
+                    mask[j] = ConstantInt::get(i8_t, 255);
+                    none_used = false;
+                } else {
+                    indices_i[j] = -1;
+                    mask[j] = ConstantInt::get(i8_t, 0);
+                    all_used = false;
+                }
+            }
+            Value *ret_i = vdelta(lut_i, indices_i);
+            if (all_used || ret == nullptr) {
+                // If the mask is all ones, or this is the first result, we don't need to preserve past results.
+                ret = ret_i;
+            } else if (!none_used) {
+                // Create a condition value for which elements of the range are valid for this index.
+                // We can't make a constant vector of <1024 x i1>, it crashes the Hexagon LLVM backend before LLVM version 6.0.
+                Value *minus_one = codegen(make_const(UInt(8, mask.size()), 255));
+                Value *hack_mask = call_intrin(lut_i->getType(), "halide.hexagon.eq.vb.vb", {ConstantVector::get(mask), minus_one});
+
+                ret = call_intrin(lut_i->getType(),
+                                  "halide.hexagon.mux.vb.vb",
+                                  {hack_mask, ret_i, ret});
+            }
+        }
+        return ret;
+    }
+
+    // We now have a single native vector to native vector shuffle. Try
+    // Generating a vdelta or vrdelta.
+    for (bool reverse : {false, true}) {
+        std::vector<int> switches;
+        if (generate_vdelta(indices, reverse, switches)) {
+            vector<Constant *> control_elements(switches.size());
+            for (int i = 0; i < (int)switches.size(); i++) {
+                control_elements[i] = ConstantInt::get(i8_t, switches[i]);
+            }
+            Value *control = ConstantVector::get(control_elements);
+            Intrinsic::ID vdelta_id = IPICK(is_128B, reverse ? Intrinsic::hexagon_V6_vrdelta : Intrinsic::hexagon_V6_vdelta);
+            return call_intrin_cast(lut_ty, vdelta_id, {lut, control});
+        }
+    }
+
+    // TODO: If the above fails, we might be able to use a vdelta and
+    // vrdelta instruction together to implement the shuffle.
+    internal_error << "Unsupported vdelta operation.\n";
+
+    // TODO: If the vdelta results are sparsely used, it might be
+    // better to use vlut.
+    return vlut(lut, indices);
 }
 
 Value *CodeGen_Hexagon::vlut(Value *lut, const vector<int> &indices) {
@@ -1303,11 +1596,23 @@ string CodeGen_Hexagon::mcpu() const {
 string CodeGen_Hexagon::mattrs() const {
     std::stringstream attrs;
     if (target.has_feature(Halide::Target::HVX_128)) {
+#if LLVM_VERSION < 60
         attrs << "+hvx-double";
+#else
+        attrs << "+hvx-length128b";
+#endif
     } else {
+#if LLVM_VERSION < 60
         attrs << "+hvx";
+#else
+        attrs << "+hvx-length64b";
+#endif
     }
+#if LLVM_VERSION >= 50
     attrs << ",+long-calls";
+#else
+    user_error << "LLVM version 5.0 or greater is required for the Hexagon backend";
+#endif
     return attrs.str();
 }
 
@@ -1438,10 +1743,7 @@ void CodeGen_Hexagon::visit(const Cast *op) {
 }
 
 void CodeGen_Hexagon::visit(const Call *op) {
-    internal_assert(op->call_type == Call::Extern ||
-                    op->call_type == Call::Intrinsic ||
-                    op->call_type == Call::PureExtern ||
-                    op->call_type == Call::PureIntrinsic)
+    internal_assert(op->is_extern() || op->is_intrinsic())
         << "Can only codegen extern calls and intrinsics\n";
 
     // Map Halide functions to Hexagon intrinsics, plus a boolean
@@ -1691,4 +1993,5 @@ void CodeGen_Hexagon::visit(const NE *op) {
     }
 }
 
-}}
+}  // namespace Internal
+}  // namespace Halide

@@ -1,54 +1,53 @@
 #include <algorithm>
 #include <iostream>
 #include <string.h>
-#include <fstream>
 
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
 
-#include "IR.h"
+#include "ApplySplit.h"
+#include "Argument.h"
+#include "Associativity.h"
+#include "CodeGen_LLVM.h"
+#include "Debug.h"
+#include "ExprUsesVar.h"
 #include "Func.h"
-#include "Util.h"
+#include "Function.h"
+#include "IR.h"
+#include "IREquality.h"
+#include "IRMutator.h"
 #include "IROperator.h"
 #include "IRPrinter.h"
-#include "IRMutator.h"
-#include "Function.h"
-#include "Argument.h"
+#include "ImageParam.h"
+#include "LLVM_Headers.h"
+#include "LLVM_Output.h"
 #include "Lower.h"
+#include "Outputs.h"
 #include "Param.h"
 #include "PrintLoopNest.h"
-#include "Debug.h"
-#include "IREquality.h"
-#include "CodeGen_LLVM.h"
-#include "LLVM_Headers.h"
-#include "Outputs.h"
-#include "LLVM_Output.h"
-#include "Substitute.h"
-#include "ExprUsesVar.h"
 #include "Simplify.h"
 #include "Solve.h"
-#include "Associativity.h"
-#include "ApplySplit.h"
-#include "ImageParam.h"
+#include "Substitute.h"
+#include "Util.h"
 
 namespace Halide {
 
+using std::map;
 using std::max;
 using std::min;
-using std::map;
+using std::ofstream;
+using std::pair;
 using std::string;
 using std::vector;
-using std::pair;
-using std::ofstream;
 
 using namespace Internal;
 
 Func::Func(const string &name) : func(unique_name(name)) {}
 
-Func::Func() : func(make_entity_name(this, "Halide::Func", 'f')) {}
+Func::Func() : func(make_entity_name(this, "Halide:.*:Func", 'f')) {}
 
-Func::Func(Expr e) : func(make_entity_name(this, "Halide::Func", 'f')) {
+Func::Func(Expr e) : func(make_entity_name(this, "Halide:.*:Func", 'f')) {
     (*this)(_) = e;
 }
 
@@ -154,7 +153,7 @@ int Func::num_update_definitions() const {
 }
 
 /** Is this function external? */
-EXPORT bool Func::is_extern() const {
+bool Func::is_extern() const {
     return func.has_extern_definition();
 }
 
@@ -162,11 +161,15 @@ EXPORT bool Func::is_extern() const {
 void Func::define_extern(const std::string &function_name,
                          const std::vector<ExternFuncArgument> &args,
                          const std::vector<Type> &types,
-                         int dimensionality,
+                         const std::vector<Var> &arguments,
                          NameMangling mangling,
                          DeviceAPI device_api,
                          bool uses_old_buffer_t) {
-    func.define_extern(function_name, args, types, dimensionality,
+    vector<string> dim_names(arguments.size());
+    for (size_t i = 0; i < arguments.size(); i++) {
+        dim_names[i] = arguments[i].name();
+    }
+    func.define_extern(function_name, args, types, dim_names,
                        mangling, device_api, uses_old_buffer_t);
 }
 
@@ -182,7 +185,7 @@ int Func::outputs() const {
 
 /** Get the name of the extern function called for an extern
  * definition. */
-EXPORT const std::string &Func::extern_function_name() const {
+const std::string &Func::extern_function_name() const {
     return func.extern_function_name();
 }
 
@@ -223,7 +226,7 @@ std::pair<int, int> Func::add_implicit_vars(vector<Var> &args) const {
         }
     }
 
-    if (func.has_pure_definition() && args.size() != (size_t)dimensions()) {
+    if (defined() && args.size() != (size_t)dimensions()) {
         user_error << "Func \"" << name() << "\" was called with "
                    << args.size() << " arguments, but was defined with " << dimensions() << "\n";
     }
@@ -253,7 +256,7 @@ std::pair<int, int> Func::add_implicit_vars(vector<Expr> &args) const {
         }
     }
 
-    if (func.has_pure_definition() && args.size() != (size_t)dimensions()) {
+    if (defined() && args.size() != (size_t)dimensions()) {
         user_error << "Func \"" << name() << "\" was called with "
                    << args.size() << " arguments, but was defined with " << dimensions() << "\n";
     }
@@ -271,7 +274,9 @@ bool var_name_match(string candidate, string var) {
 }
 }
 
-const std::string &Stage::name() const {
+std::string Stage::name() const {
+    std::string stage_name = (stage_index == 0) ?
+        function.name() : function.name() + ".update(" + std::to_string(stage_index - 1) + ")";
     return stage_name;
 }
 
@@ -287,9 +292,10 @@ void Stage::set_dim_type(VarOrRVar var, ForType t) {
             // validate that this doesn't introduce a race condition.
             if (!dims[i].is_pure() && var.is_rvar &&
                 (t == ForType::Vectorized || t == ForType::Parallel ||
-                 t == ForType::GPUBlock || t == ForType::GPUThread)) {
+                 t == ForType::GPUBlock || t == ForType::GPUThread ||
+                 t == ForType::GPULane)) {
                 user_assert(definition.schedule().allow_race_conditions())
-                    << "In schedule for " << stage_name
+                    << "In schedule for " << name()
                     << ", marking var " << var.name()
                     << " as parallel or vectorized may introduce a race"
                     << " condition resulting in incorrect output."
@@ -304,14 +310,14 @@ void Stage::set_dim_type(VarOrRVar var, ForType t) {
 
         } else if (t == ForType::Vectorized) {
             user_assert(dims[i].for_type != ForType::Vectorized)
-                << "In schedule for " << stage_name
+                << "In schedule for " << name()
                 << ", can't vectorize across " << var.name()
                 << " because Func is already vectorized across " << dims[i].var << "\n";
         }
     }
 
     if (!found) {
-        user_error << "In schedule for " << stage_name
+        user_error << "In schedule for " << name()
                    << ", could not find dimension "
                    << var.name()
                    << " to mark as " << t
@@ -331,7 +337,7 @@ void Stage::set_dim_device_api(VarOrRVar var, DeviceAPI device_api) {
     }
 
     if (!found) {
-        user_error << "In schedule for " << stage_name
+        user_error << "In schedule for " << name()
                    << ", could not find dimension "
                    << var.name()
                    << " to set to device API " << static_cast<int>(device_api)
@@ -352,21 +358,19 @@ std::string Stage::dump_argument_list() const {
 
 namespace {
 
-class SubstituteSelfReference : public IRMutator {
-    using IRMutator::visit;
+class SubstituteSelfReference : public IRMutator2 {
+    using IRMutator2::visit;
 
     const string func;
     const Function substitute;
     const vector<Var> new_args;
 
-    void visit(const Call *c) {
-        IRMutator::visit(c);
+    Expr visit(const Call *c) override {
+        Expr expr = IRMutator2::visit(c);
         c = expr.as<Call>();
         internal_assert(c);
 
         if ((c->call_type == Call::Halide) && (func == c->name)) {
-            internal_assert(!c->func.defined())
-                << "func should not have been defined for a self-reference\n";
             debug(4) << "...Replace call to Func \"" << c->name << "\" with "
                      << "\"" << substitute.name() << "\"\n";
             vector<Expr> args;
@@ -374,6 +378,7 @@ class SubstituteSelfReference : public IRMutator {
             args.insert(args.end(), new_args.begin(), new_args.end());
             expr = Call::make(substitute, args, c->value_index);
         }
+        return expr;
     }
 public:
     SubstituteSelfReference(const string &func, const Function &substitute,
@@ -468,9 +473,9 @@ bool apply_fuse(const Split &s, vector<ReductionVariable> &rvars,
                 vector<Expr> &predicates, vector<Expr> &args,
                 vector<Expr> &values, map<string, Expr> &dim_extent_alignment) {
     internal_assert(s.is_fuse());
-    const auto iter_outer = std::find_if(rvars.begin(), rvars.end(),
+    const auto &iter_outer = std::find_if(rvars.begin(), rvars.end(),
         [&s](const ReductionVariable &rv) { return (s.outer == rv.var); });
-    const auto iter_inner = std::find_if(rvars.begin(), rvars.end(),
+    const auto &iter_inner = std::find_if(rvars.begin(), rvars.end(),
         [&s](const ReductionVariable &rv) { return (s.inner == rv.var); });
 
     Expr inner_min, inner_extent, outer_min, outer_extent;
@@ -505,7 +510,7 @@ bool apply_purify(const Split &s, vector<ReductionVariable> &rvars,
                   vector<Expr> &predicates, vector<Expr> &args,
                   vector<Expr> &values, map<string, Expr> &dim_extent_alignment) {
     internal_assert(s.is_purify());
-    const auto iter = std::find_if(rvars.begin(), rvars.end(),
+    const auto &iter = std::find_if(rvars.begin(), rvars.end(),
         [&s](const ReductionVariable &rv) { return (s.old_var == rv.var); });
     if (iter != rvars.end()) {
         debug(4) << "  Purify RVar " << iter->var << " into Var " << s.outer
@@ -526,7 +531,7 @@ bool apply_rename(const Split &s, vector<ReductionVariable> &rvars,
                   vector<Expr> &predicates, vector<Expr> &args,
                   vector<Expr> &values, map<string, Expr> &dim_extent_alignment) {
     internal_assert(s.is_rename());
-    const auto iter = std::find_if(rvars.begin(), rvars.end(),
+    const auto &iter = std::find_if(rvars.begin(), rvars.end(),
         [&s](const ReductionVariable &rv) { return (s.old_var == rv.var); });
     if (iter != rvars.end()) {
         debug(4) << "  Renaming " << iter->var << " into " << s.outer << "\n";
@@ -588,13 +593,7 @@ Func Stage::rfactor(RVar r, Var v) {
 Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
     user_assert(!definition.is_init()) << "rfactor() must be called on an update definition\n";
 
-    string func_name;
-    {
-        vector<std::string> tmp = split_string(stage_name, ".update(");
-        internal_assert(!tmp.empty() && !tmp[0].empty());
-        func_name = tmp[0];
-    }
-
+    const string &func_name = function.name();
     vector<Expr> &args = definition.args();
     vector<Expr> &values = definition.values();
 
@@ -603,7 +602,7 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
     const auto &prover_result = prove_associativity(func_name, args, values);
 
     user_assert(prover_result.associative())
-        << "Failed to call rfactor() on " << stage_name
+        << "Failed to call rfactor() on " << name()
         << " since it can't prove associativity of the operator\n";
     internal_assert(prover_result.size() == values.size());
 
@@ -621,10 +620,10 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
         const Var &v = i.second;
         {
             // Check that the RVar are in the dims list
-            const auto iter = std::find_if(dims.begin(), dims.end(),
+            const auto &iter = std::find_if(dims.begin(), dims.end(),
                 [&rv](const Dim &dim) { return var_name_match(dim.var, rv.name()); });
             user_assert((iter != dims.end()) && (*iter).is_rvar())
-                << "In schedule for " << stage_name
+                << "In schedule for " << name()
                 << ", can't perform rfactor() on " << rv.name()
                 << " since it is not in the reduction domain\n"
                 << dump_argument_list();
@@ -635,7 +634,7 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
             const auto &iter = std::find_if(dims.begin(), dims.end(),
                 [&v](const Dim &dim) { return var_name_match(dim.var, v.name()); });
             user_assert(iter == dims.end())
-                << "In schedule for " << stage_name
+                << "In schedule for " << name()
                 << ", can't rename the rvars " << rv.name() << " into " << v.name()
                 << ", since it is already used in this Func's schedule elsewhere.\n"
                 << dump_argument_list();
@@ -649,7 +648,7 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
         for (int i = dims.size() - 1; i >= 0; --i) {
             if ((last_rvar != -1) && is_rfactored[i]) {
                 user_assert(is_rfactored[last_rvar])
-                    << "In schedule for " << stage_name
+                    << "In schedule for " << name()
                     << ", can't rfactor an inner dimension " << dims[i].var
                     << " without rfactoring the outer dimensions, since the "
                     << "operator is non-commutative.\n"
@@ -693,9 +692,9 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
     // intermediate and new merge Funcs.
     std::sort(preserved.begin(), preserved.end(),
         [&](const pair<RVar, Var> &lhs, const pair<RVar, Var> &rhs){
-            const auto iter_lhs = std::find_if(rvars.begin(), rvars.end(),
+            const auto &iter_lhs = std::find_if(rvars.begin(), rvars.end(),
                 [&lhs](const ReductionVariable &rv) { return var_name_match(rv.var, lhs.first.name()); });
-            const auto iter_rhs = std::find_if(rvars.begin(), rvars.end(),
+            const auto &iter_rhs = std::find_if(rvars.begin(), rvars.end(),
                 [&rhs](const ReductionVariable &rv) { return var_name_match(rv.var, rhs.first.name()); });
             return iter_lhs < iter_rhs;
         }
@@ -767,7 +766,7 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
         update_args[i + args.size()] = vars_rename[i];
         RVar rvar_kept = rvars_kept[i];
         // Find the full name of rvar_kept in rvars
-        const auto iter = std::find_if(rvars.begin(), rvars.end(),
+        const auto &iter = std::find_if(rvars.begin(), rvars.end(),
             [&rvar_kept](const ReductionVariable &rv) { return var_name_match(rv.var, rvar_kept.name()); });
         substitution_map[iter->var] = vars_rename[i];
     }
@@ -810,9 +809,10 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
 
     // Copy over the storage order of the original pure dims
     vector<StorageDim> &intm_storage_dims = intm.function().schedule().storage_dims();
-    internal_assert(intm_storage_dims.size() == func_schedule.storage_dims().size() + vars_rename.size());
-    for (size_t i = 0; i < func_schedule.storage_dims().size(); ++i) {
-        intm_storage_dims[i] = func_schedule.storage_dims()[i];
+    internal_assert(intm_storage_dims.size() ==
+                    function.schedule().storage_dims().size() + vars_rename.size());
+    for (size_t i = 0; i < function.schedule().storage_dims().size(); ++i) {
+        intm_storage_dims[i] = function.schedule().storage_dims()[i];
     }
 
     for (size_t i = 0; i < rvars_kept.size(); ++i) {
@@ -826,7 +826,7 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
     // Add pure Vars from the original init definition to the dims list
     // if they are not already in the list
     for (const Var &v : dim_vars) {
-        const auto iter = std::find_if(dims.begin(), dims.end(),
+        const auto &iter = std::find_if(dims.begin(), dims.end(),
             [&v](const Dim &dim) { return var_name_match(dim.var, v.name()); });
         if (iter == dims.end()) {
             Dim d = {v.name(), ForType::Serial, DeviceAPI::None, Dim::Type::PureVar};
@@ -872,10 +872,10 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
         if (!prover_result.xs[i].var.empty()) {
             Expr prev_val = Call::make(intm.output_types()[i], func_name,
                                        f_store_args, Call::CallType::Halide,
-                                       nullptr, i);
+                                       FunctionPtr(), i);
             replacements.emplace(prover_result.xs[i].var, prev_val);
         } else {
-            user_warning << "Update definition of " << stage_name << " at index " << i
+            user_warning << "Update definition of " << name() << " at index " << i
                          << " doesn't depend on the previous value. This isn't a"
                          << " reduction operation\n";
         }
@@ -892,7 +892,7 @@ Func Stage::rfactor(vector<pair<RVar, Var>> preserved) {
 }
 
 void Stage::split(const string &old, const string &outer, const string &inner, Expr factor, bool exact, TailStrategy tail) {
-    debug(4) << "In schedule for " << stage_name << ", split " << old << " into "
+    debug(4) << "In schedule for " << name() << ", split " << old << " into "
              << outer << " and " << inner << " with factor of " << factor << "\n";
     vector<Dim> &dims = definition.schedule().dims();
 
@@ -901,7 +901,7 @@ void Stage::split(const string &old, const string &outer, const string &inner, E
         string new_names[2] = {inner, outer};
         for (int j = 0; j < 2; j++) {
             if (var_name_match(dims[i].var, new_names[j]) && new_names[j] != old) {
-                user_error << "In schedule for " << stage_name
+                user_error << "In schedule for " << name()
                            << ", can't create var " << new_names[j]
                            << " using a split or tile, because " << new_names[j]
                            << " is already used in this Func's schedule elsewhere.\n"
@@ -927,25 +927,59 @@ void Stage::split(const string &old, const string &outer, const string &inner, E
     }
 
     if (!found) {
-        user_error << "In schedule for " << stage_name
+        user_error << "In schedule for " << name()
                    << ", could not find split dimension: "
                    << old
                    << "\n"
                    << dump_argument_list();
     }
 
+    bool round_up_ok = !exact;
+    if (round_up_ok && !definition.is_init()) {
+        // If it's the outermost split in this dimension, RoundUp
+        // is OK. Otherwise we need GuardWithIf to avoid
+        // recomputing values in the case where the inner split
+        // factor does not divide the outer split factor.
+        std::set<string> inner_vars;
+        for (const Split &s : definition.schedule().splits()) {
+            if (s.is_split()) {
+                inner_vars.insert(s.inner);
+                if (inner_vars.count(s.old_var)) {
+                    inner_vars.insert(s.outer);
+                }
+            } else if (s.is_rename() || s.is_purify()) {
+                if (inner_vars.count(s.old_var)) {
+                    inner_vars.insert(s.outer);
+                }
+            } else if (s.is_fuse()) {
+                if (inner_vars.count(s.inner) || inner_vars.count(s.outer)) {
+                    inner_vars.insert(s.old_var);
+                }
+            }
+        }
+        round_up_ok = !inner_vars.count(old_name);
+        user_assert(round_up_ok || tail != TailStrategy::RoundUp)
+            << "Can't use TailStrategy::RoundUp for splitting " << old_name
+            << " in update definition of " << name() << ". "
+            << "It may redundantly recompute some values, which "
+            << "could change the meaning of the algorithm. "
+            << "Use TailStrategy::GuardWithIf instead.";
+    }
+
+
     if (tail == TailStrategy::Auto) {
         // Select a tail strategy
         if (exact) {
             tail = TailStrategy::GuardWithIf;
         } else if (!definition.is_init()) {
-            tail = TailStrategy::RoundUp;
+            tail = round_up_ok ? TailStrategy::RoundUp : TailStrategy::GuardWithIf;
         } else {
             // We should employ ShiftInwards when we can to prevent
             // overcompute and adding constraints to the bounds of
             // inputs and outputs. However, if we're already covered
-            // by an earlier ShiftInwards split, there's no point - it
-            // just complicates the IR and confuses bounds inference. An example of this is:
+            // by an earlier larger ShiftInwards split, there's no
+            // point - it just complicates the IR and confuses bounds
+            // inference. An example of this is:
             //
             // f.vectorize(x, 8).unroll(x, 4);
             //
@@ -963,19 +997,22 @@ void Stage::split(const string &old, const string &outer, const string &inner, E
             //
             // It's only the tail/epilogue that changes.
 
-            std::set<string> descends_from_shiftinwards_outer;
+            std::map<string, Expr> descends_from_shiftinwards_outer;
             for (const Split &s : definition.schedule().splits()) {
+                auto it = descends_from_shiftinwards_outer.find(s.old_var);
                 if (s.is_split() && s.tail == TailStrategy::ShiftInwards) {
-                    descends_from_shiftinwards_outer.insert(s.outer);
-                } else if (s.is_split() && descends_from_shiftinwards_outer.count(s.old_var)) {
-                    descends_from_shiftinwards_outer.insert(s.inner);
-                    descends_from_shiftinwards_outer.insert(s.outer);
+                    descends_from_shiftinwards_outer[s.outer] = s.factor;
+                } else if (s.is_split() && it != descends_from_shiftinwards_outer.end()) {
+                    descends_from_shiftinwards_outer[s.inner] = it->second;
+                    descends_from_shiftinwards_outer[s.outer] = it->second;
                 } else if ((s.is_rename() || s.is_purify()) &&
-                           descends_from_shiftinwards_outer.count(s.old_var)) {
-                    descends_from_shiftinwards_outer.insert(s.outer);
+                           it != descends_from_shiftinwards_outer.end()) {
+                    descends_from_shiftinwards_outer[s.outer] = it->second;
                 }
             }
-            if (descends_from_shiftinwards_outer.count(old_name)) {
+            auto it = descends_from_shiftinwards_outer.find(old_name);
+            if (it != descends_from_shiftinwards_outer.end() &&
+                can_prove(it->second >= factor)) {
                 tail = TailStrategy::RoundUp;
             } else {
                 tail = TailStrategy::ShiftInwards;
@@ -1027,7 +1064,7 @@ Stage &Stage::fuse(VarOrRVar inner, VarOrRVar outer, VarOrRVar fused) {
                                     << "into RVar " << fused.name() << "\n";
     }
 
-    debug(4) << "In schedule for " << stage_name << ", fuse " << outer.name()
+    debug(4) << "In schedule for " << name() << ", fuse " << outer.name()
              << " and " << inner.name() << " into " << fused.name() << "\n";
 
     // Replace the old dimensions with the new dimension in the dims list
@@ -1045,7 +1082,7 @@ Stage &Stage::fuse(VarOrRVar inner, VarOrRVar outer, VarOrRVar fused) {
         }
     }
     if (!found_outer) {
-        user_error << "In schedule for " << stage_name
+        user_error << "In schedule for " << name()
                    << ", could not find outer fuse dimension: "
                    << outer.name()
                    << "\n"
@@ -1072,7 +1109,7 @@ Stage &Stage::fuse(VarOrRVar inner, VarOrRVar outer, VarOrRVar fused) {
     }
 
     if (!found_inner) {
-        user_error << "In schedule for " << stage_name
+        user_error << "In schedule for " << name()
                    << ", could not find inner fuse dimension: "
                    << inner.name()
                    << "\n"
@@ -1106,7 +1143,7 @@ Stage Stage::specialize(Expr condition) {
     Internal::CheckForFreeVars check;
     condition.accept(&check);
     if (!check.offending_var.empty()) {
-        user_error << "Specialization condition " << condition << " for " << stage_name
+        user_error << "Specialization condition " << condition << " for " << name()
                    << " depends on Var or RVar " << check.offending_var << ". "
                    << "Specialization conditions may not depend on any Vars or RVars.\n";
     }
@@ -1116,7 +1153,7 @@ Stage Stage::specialize(Expr condition) {
     const vector<Specialization> &specializations = definition.specializations();
     for (size_t i = 0; i < specializations.size(); i++) {
         if (equal(condition, specializations[i].condition)) {
-            return Stage(specializations[i].definition, stage_name, dim_vars, func_schedule);
+            return Stage(function, specializations[i].definition, stage_index, dim_vars);
         }
     }
 
@@ -1125,7 +1162,7 @@ Stage Stage::specialize(Expr condition) {
         << "Cannot add new specializations after specialize_fail().";
     const Specialization &s = definition.add_specialization(condition);
 
-    return Stage(s.definition, stage_name, dim_vars, func_schedule);
+    return Stage(function, s.definition, stage_index, dim_vars);
 }
 
 void Stage::specialize_fail(const std::string &message) {
@@ -1140,12 +1177,12 @@ void Stage::specialize_fail(const std::string &message) {
 
 Stage &Stage::purify(VarOrRVar old_var, VarOrRVar new_var) {
     user_assert(old_var.is_rvar && !new_var.is_rvar)
-        << "In schedule for " << stage_name
+        << "In schedule for " << name()
         << ", can't rename " << (old_var.is_rvar ? "RVar " : "Var ") << old_var.name()
         << " to " << (new_var.is_rvar ? "RVar " : "Var ") << new_var.name()
         << "; purify must take a RVar as old_Var and a Var as new_var\n";
 
-    debug(4) << "In schedule for " << stage_name << ", purify RVar "
+    debug(4) << "In schedule for " << name() << ", purify RVar "
              << old_var.name() << " to Var " << new_var.name() << "\n";
 
     StageSchedule &schedule = definition.schedule();
@@ -1166,7 +1203,7 @@ Stage &Stage::purify(VarOrRVar old_var, VarOrRVar new_var) {
 
     if (!found) {
         user_error
-            << "In schedule for " << stage_name
+            << "In schedule for " << name()
             << ", could not find rename dimension: "
             << old_var.name()
             << "\n"
@@ -1179,7 +1216,7 @@ Stage &Stage::purify(VarOrRVar old_var, VarOrRVar new_var) {
 }
 
 void Stage::remove(const string &var) {
-    debug(4) << "In schedule for " << stage_name << ", remove " << var << "\n";
+    debug(4) << "In schedule for " << name() << ", remove " << var << "\n";
 
     StageSchedule &schedule = definition.schedule();
 
@@ -1197,7 +1234,7 @@ void Stage::remove(const string &var) {
 
     if (!found) {
         user_error
-            << "In schedule for " << stage_name
+            << "In schedule for " << name()
             << ", could not find remove dimension: "
             << var
             << "\n"
@@ -1224,7 +1261,7 @@ void Stage::remove(const string &var) {
             if (splits[i-1].inner == old_name ||
                 splits[i-1].outer == old_name) {
                 user_error
-                    << "In schedule for " << stage_name
+                    << "In schedule for " << name()
                     << ", can't remove variable " << old_name
                     << " because it has already been fused into "
                     << splits[i-1].old_var << "\n"
@@ -1247,7 +1284,7 @@ void Stage::remove(const string &var) {
             }
             if (splits[i-1].old_var == old_name) {
                 user_error
-                    << "In schedule for " << stage_name
+                    << "In schedule for " << name()
                     << ", can't remove a variable " << old_name
                     << " because it has already been renamed or split.\n"
                     << dump_argument_list();
@@ -1261,7 +1298,7 @@ void Stage::remove(const string &var) {
             }
             if (splits[i-1].old_var == old_name) {
                 user_error
-                    << "In schedule for " << stage_name
+                    << "In schedule for " << name()
                     << ", can't remove a variable " << old_name
                     << " because it has already been renamed or split.\n"
                     << dump_argument_list();
@@ -1277,17 +1314,17 @@ void Stage::remove(const string &var) {
 Stage &Stage::rename(VarOrRVar old_var, VarOrRVar new_var) {
     if (old_var.is_rvar) {
         user_assert(new_var.is_rvar)
-            << "In schedule for " << stage_name
+            << "In schedule for " << name()
             << ", can't rename RVar " << old_var.name()
             << " to Var " << new_var.name() << "\n";
     } else {
         user_assert(!new_var.is_rvar)
-            << "In schedule for " << stage_name
+            << "In schedule for " << name()
             << ", can't rename Var " << old_var.name()
             << " to RVar " << new_var.name() << "\n";
     }
 
-    debug(4) << "In schedule for " << stage_name << ", rename " << old_var.name()
+    debug(4) << "In schedule for " << name() << ", rename " << old_var.name()
              << " to " << new_var.name() << "\n";
 
     StageSchedule &schedule = definition.schedule();
@@ -1308,7 +1345,7 @@ Stage &Stage::rename(VarOrRVar old_var, VarOrRVar new_var) {
 
     if (!found) {
         user_error
-            << "In schedule for " << stage_name
+            << "In schedule for " << name()
             << ", could not find rename dimension: "
             << old_var.name()
             << "\n"
@@ -1323,7 +1360,7 @@ Stage &Stage::rename(VarOrRVar old_var, VarOrRVar new_var) {
             if (splits[i-1].inner == old_name ||
                 splits[i-1].outer == old_name) {
                 user_error
-                    << "In schedule for " << stage_name
+                    << "In schedule for " << name()
                     << ", can't rename variable " << old_name
                     << " because it has already been fused into "
                     << splits[i-1].old_var << "\n"
@@ -1347,7 +1384,7 @@ Stage &Stage::rename(VarOrRVar old_var, VarOrRVar new_var) {
             }
             if (splits[i-1].old_var == old_name) {
                 user_error
-                    << "In schedule for " << stage_name
+                    << "In schedule for " << name()
                     << ", can't rename a variable " << old_name
                     << " because it has already been renamed or split.\n"
                     << dump_argument_list();
@@ -1527,6 +1564,12 @@ Stage &Stage::gpu_threads(VarOrRVar tx, VarOrRVar ty, VarOrRVar tz, DeviceAPI de
     return *this;
 }
 
+Stage &Stage::gpu_lanes(VarOrRVar tx, DeviceAPI device_api) {
+    set_dim_device_api(tx, device_api);
+    set_dim_type(tx, ForType::GPULane);
+    return *this;
+}
+
 Stage &Stage::gpu_blocks(VarOrRVar bx, DeviceAPI device_api) {
     set_dim_device_api(bx, device_api);
     set_dim_type(bx, ForType::GPUBlock);
@@ -1574,17 +1617,7 @@ Stage &Stage::gpu(VarOrRVar bx, VarOrRVar by, VarOrRVar bz,
     return gpu_blocks(bx, by, bz).gpu_threads(tx, ty, tz);
 }
 
-Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar bx, Var tx, Expr x_size,
-                       TailStrategy tail, DeviceAPI device_api) {
-    split(x, bx, tx, x_size, tail);
-    set_dim_device_api(bx, device_api);
-    set_dim_device_api(tx, device_api);
-    set_dim_type(bx, ForType::GPUBlock);
-    set_dim_type(tx, ForType::GPUThread);
-    return *this;
-}
-
-Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar bx, RVar tx, Expr x_size,
+Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar bx, VarOrRVar tx, Expr x_size,
                        TailStrategy tail, DeviceAPI device_api) {
     split(x, bx, tx, x_size, tail);
     set_dim_device_api(bx, device_api);
@@ -1624,15 +1657,7 @@ Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar y,
 }
 
 Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar y,
-                       VarOrRVar tx, Var ty,
-                       Expr x_size, Expr y_size,
-                       TailStrategy tail,
-                       DeviceAPI device_api) {
-    return gpu_tile(x, y, x, y, tx, ty, x_size, y_size, tail, device_api);
-}
-
-Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar y,
-                       VarOrRVar tx, RVar ty,
+                       VarOrRVar tx, VarOrRVar ty,
                        Expr x_size, Expr y_size,
                        TailStrategy tail,
                        DeviceAPI device_api) {
@@ -1680,42 +1705,6 @@ Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar y, VarOrRVar z,
     return gpu_tile(x, y, z, x, y, z, tx, ty, tz, x_size, y_size, z_size, tail, device_api);
 }
 
-Stage &Stage::gpu_tile(VarOrRVar x, Expr x_size, TailStrategy tail, DeviceAPI device_api) {
-    VarOrRVar bx("__deprecated_block_id_x", x.is_rvar),
-        tx("__deprecated_thread_id_x", x.is_rvar);
-    split(x, bx, tx, x_size, tail);
-    set_dim_device_api(bx, device_api);
-    set_dim_device_api(tx, device_api);
-    set_dim_type(bx, ForType::GPUBlock);
-    set_dim_type(tx, ForType::GPUThread);
-    return *this;
-}
-
-
-Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar y,
-                       Expr x_size, Expr y_size,
-                       TailStrategy tail,
-                       DeviceAPI device_api) {
-    VarOrRVar bx("__deprecated_block_id_x", x.is_rvar),
-        by("__deprecated_block_id_y", y.is_rvar),
-        tx("__deprecated_thread_id_x", x.is_rvar),
-        ty("__deprecated_thread_id_y", y.is_rvar);
-    return gpu_tile(x, y, bx, by, tx, ty, x_size, y_size, tail, device_api);
-}
-
-Stage &Stage::gpu_tile(VarOrRVar x, VarOrRVar y, VarOrRVar z,
-                       Expr x_size, Expr y_size, Expr z_size,
-                       TailStrategy tail,
-                       DeviceAPI device_api) {
-    VarOrRVar bx("__deprecated_block_id_x", x.is_rvar),
-        by("__deprecated_block_id_y", y.is_rvar),
-        bz("__deprecated_block_id_z", z.is_rvar),
-        tx("__deprecated_thread_id_x", x.is_rvar),
-        ty("__deprecated_thread_id_y", y.is_rvar),
-        tz("__deprecated_thread_id_z", z.is_rvar);
-    return gpu_tile(x, y, z, bx, by, bz, tx, ty, tz, x_size, y_size, z_size, tail, device_api);
-}
-
 Stage &Stage::hexagon(VarOrRVar x) {
     set_dim_device_api(x, DeviceAPI::Hexagon);
     return *this;
@@ -1733,52 +1722,117 @@ Stage &Stage::prefetch(const Internal::Parameter &param, VarOrRVar var, Expr off
     return *this;
 }
 
+Stage &Stage::compute_with(LoopLevel loop_level, const map<string, LoopAlignStrategy> &align) {
+    loop_level.lock();
+    user_assert(!loop_level.is_inlined() && !loop_level.is_root())
+        << "Undefined loop level to compute with\n";
+    user_assert(loop_level.func() != function.name())
+        << "Cannot schedule " << name() << " to be computed with "
+        << loop_level.to_string() << "\n";
+    user_assert(!function.has_extern_definition())
+        << "compute_with() on extern Func " << name() << " is not allowed\n";
+
+    // We have to mark the fuse level on the "original" definition (the one
+    // without the specialization) to ensure there is no competing compute_with.
+    Definition &original_def = (stage_index == 0) ? function.definition() : function.update(stage_index - 1);
+    user_assert(original_def.specializations().empty())
+            << "Func " << name() << " is scheduled to be computed with "
+            << loop_level.func() << ", so it must not have any specializations.\n";
+
+    FuseLoopLevel &fuse_level = original_def.schedule().fuse_level();
+    if (!fuse_level.level.lock().is_inlined()) {
+        user_warning << name() << " already has a compute_with at " << fuse_level.level.to_string()
+                     << ". Replacing it with a new compute_with at " << loop_level.to_string() << "\n";
+    }
+    fuse_level.level = loop_level;
+    fuse_level.align = align;
+    return *this;
+}
+
+Stage &Stage::compute_with(LoopLevel loop_level, const vector<pair<VarOrRVar, LoopAlignStrategy>> &align) {
+    map<string, LoopAlignStrategy> align_str;
+    for (const auto &iter: align) {
+        align_str.emplace(iter.first.name(), iter.second);
+    }
+    return compute_with(loop_level, align_str);
+}
+
+Stage &Stage::compute_with(LoopLevel loop_level, LoopAlignStrategy align) {
+    map<string, LoopAlignStrategy> align_str = {{loop_level.lock().var().name(), align}};
+    return compute_with(loop_level, align_str);
+}
+
+Stage &Stage::compute_with(Stage s, VarOrRVar var, const vector<pair<VarOrRVar, LoopAlignStrategy>> &align) {
+    return compute_with(LoopLevel(s.function, var, s.stage_index), align);
+}
+
+Stage &Stage::compute_with(Stage s, VarOrRVar var, LoopAlignStrategy align) {
+    return compute_with(LoopLevel(s.function, var, s.stage_index), align);
+}
+
+/** Attempt to get the source file and line where this stage was
+ * defined by parsing the process's own debug symbols. Returns an
+ * empty string if no debug symbols were found or the debug
+ * symbols were not understood. Works on OS X and Linux only. */
+std::string Stage::source_location() const {
+    return definition.source_location();
+}
+
 void Func::invalidate_cache() {
     if (pipeline_.defined()) {
         pipeline_.invalidate_cache();
     }
 }
 
-Func Func::in(const Func &f) {
-    invalidate_cache();
-    user_assert(name() != f.name()) << "Cannot call 'in()' on itself\n";
-    const map<string, IntrusivePtr<FunctionContents>> &wrappers = func.wrappers();
-    const auto &iter = wrappers.find(f.name());
-    if (iter == wrappers.end()) {
-        Func wrapper(name() + "_in_" + f.name());
-        wrapper(args()) = (*this)(args());
-        func.add_wrapper(f.name(), wrapper.func);
-        return wrapper;
-    }
+namespace {
 
-    IntrusivePtr<FunctionContents> wrapper_contents = iter->second;
-    internal_assert(wrapper_contents.defined());
+void validate_wrapper(const string &name, const map<string, FunctionPtr> &wrappers,
+                      const vector<Func> &fs, const FunctionPtr &wrapper) {
+    if (!wrappers.empty() && !fs.empty()) {
+        internal_assert(wrapper.defined() && !name.empty());
+        // Make sure all the other Funcs in 'fs' share the same wrapper and no
+        // other Func not in 'fs' share the same wrapper
+        for (const auto &it : wrappers) {
+            if (it.first == fs[0].name()) {
+                continue;
+            }
+            const auto &fs_iter = std::find_if(
+                fs.begin(), fs.end(), [&it](const Func &f) { return f.name() == it.first; });
+            bool in_fs = fs_iter != fs.end();
 
-    // Make sure that no other Func shares the same wrapper as 'f'
-    for (const auto &it : wrappers) {
-        if (it.first == f.name()) {
-            continue;
+            if (in_fs) {
+                user_assert(it.second.same_as(wrapper))
+                    << it.first << " should have shared the same wrapper as " << fs[0].name() << "\n";
+            } else {
+                user_assert(!it.second.same_as(wrapper))
+                    << "Redefinition of shared wrapper [" << name << " -> "
+                    << Function(wrapper).name() << "] in " << fs[0].name() << " is illegal since "
+                    << it.first << " shares the same wrapper but is not part of the redefinition\n";
+            }
         }
-        user_assert(!it.second.same_as(wrapper_contents))
-            << "Redefinition of shared wrapper with " << it.first << " [" << name() << " -> "
-            << Function(wrapper_contents).name() << "] in " << f.name() << " is not allowed\n";
     }
-    Function wrapper(wrapper_contents);
-    internal_assert(wrapper.frozen());
-    return Func(wrapper);
 }
 
-Func Func::in(const vector<Func>& fs) {
-    invalidate_cache();
-    if (fs.empty()) {
-        user_error << "Could not create a wrapper for an empty list of Funcs\n";
-    }
+Func create_in_wrapper(Function wrapped_fn, string wrapper_name) {
+    Func wrapper(wrapped_fn.new_function_in_same_group(wrapper_name));
+    vector<Var> args = Func(wrapped_fn).args();
+    wrapper(args) = Func(wrapped_fn)(args);
+    return wrapper;
+}
 
-    // Either all Funcs have the same wrapper or they don't already have any wrappers.
-    // Otherwise, throw an error.
-    const map<string, IntrusivePtr<FunctionContents>> &wrappers = func.wrappers();
+Func create_clone_wrapper(Function wrapped_fn, string wrapper_name) {
+    Func wrapper(wrapped_fn.new_function_in_same_group(wrapper_name));
+    std::map<FunctionPtr, FunctionPtr> empty;
+    wrapped_fn.deep_copy(wrapper.name(), wrapper.function().get_contents(), empty);
+    return wrapper;
+}
 
-    const auto &iter = wrappers.find(fs[0].name());
+Func get_wrapper(Function wrapped_fn, string wrapper_name, const vector<Func> &fs, bool clone) {
+    // Either all Funcs in 'fs' have the same wrapper or they don't already
+    // have any wrappers. Otherwise, throw an error. If 'fs' is empty, then
+    // it is a global wrapper.
+    const map<string, FunctionPtr> &wrappers = wrapped_fn.wrappers();
+    const auto &iter = fs.empty() ? wrappers.find("") : wrappers.find(fs[0].name());
     if (iter == wrappers.end()) {
         // Make sure the other Funcs also don't have any wrappers
         for (size_t i = 1; i < fs.size(); ++i) {
@@ -1786,81 +1840,136 @@ Func Func::in(const vector<Func>& fs) {
                 << "Cannot define the wrapper since " << fs[i].name()
                 << " already has a wrapper while " << fs[0].name() << " doesn't \n";
         }
-        Func wrapper(name() + "_wrapper");
-        wrapper(args()) = (*this)(args());
-        for (const Func &f : fs) {
-            user_assert(name() != f.name()) << "Cannot call 'in()' on itself\n";
-            func.add_wrapper(f.name(), wrapper.func);
+        Func wrapper = clone ? create_clone_wrapper(wrapped_fn, wrapper_name)
+                             : create_in_wrapper(wrapped_fn, wrapper_name);
+        Function wrapper_fn = wrapper.function();
+        if (fs.empty()) {
+            // Add global wrapper
+            wrapped_fn.add_wrapper("", wrapper_fn);
+        } else {
+            for (const Func &f : fs) {
+                user_assert(wrapped_fn.name() != f.name())
+                    << "Cannot create wrapper of itself (\"" << wrapped_fn.name() <<  "\")\n";
+                wrapped_fn.add_wrapper(f.name(), wrapper_fn);
+            }
         }
         return wrapper;
     }
+    internal_assert(iter->second.defined());
+    validate_wrapper(wrapped_fn.name(), wrappers, fs, iter->second);
 
-    IntrusivePtr<FunctionContents> wrapper_contents = iter->second;
-    internal_assert(wrapper_contents.defined());
-
-    // Make sure all the other Funcs in 'fs' share the same wrapper and no other
-    // Func not in 'fs' share the same wrapper.
-    for (const auto &it : wrappers) {
-        if (it.first == fs[0].name()) {
-            continue;
-        }
-        const auto &fs_iter = std::find_if(
-            fs.begin(), fs.end(), [&it](const Func &f) { return f.name() == it.first; });
-        bool in_fs = fs_iter != fs.end();
-
-        if (in_fs) {
-            user_assert(it.second.same_as(wrapper_contents))
-                << it.first << " should have shared the same wrapper as " << fs[0].name() << "\n";
-        } else {
-            user_assert(!it.second.same_as(wrapper_contents))
-                << "Redefinition of shared wrapper [" << name() << " -> "
-                << Function(wrapper_contents).name() << "] in " << fs[0].name() << " is illegal since "
-                << it.first << " shares the same wrapper but not part of the redefinition\n";
-        }
-    }
-    Function wrapper(wrapper_contents);
+    Function wrapper(iter->second);
     internal_assert(wrapper.frozen());
     return Func(wrapper);
+}
+
+} // anonymous namespace
+
+Func Func::in(const Func &f) {
+    invalidate_cache();
+    vector<Func> fs = {f};
+    return get_wrapper(func, name() + "_in_" + f.name(), fs, false);
+}
+
+Func Func::in(const vector<Func> &fs) {
+    if (fs.empty()) {
+        user_error << "Could not create a in wrapper for an empty list of Funcs\n";
+    }
+    invalidate_cache();
+    return get_wrapper(func, name() + "_wrapper", fs, false);
 }
 
 Func Func::in() {
     invalidate_cache();
-    const map<string, IntrusivePtr<FunctionContents>> &wrappers = func.wrappers();
-    const auto &iter = wrappers.find("");
-    if (iter == wrappers.end()) {
-        Func wrapper(name() + "_global_wrapper");
-        wrapper(args()) = (*this)(args());
-        func.add_wrapper("", wrapper.func);
-        return wrapper;
+    return get_wrapper(func, name() + "_global_wrapper", {}, false);
+}
+
+Func Func::clone_in(const Func &f) {
+    invalidate_cache();
+    vector<Func> fs = {f};
+    return get_wrapper(func, name() + "_clone_in_" + f.name(), fs, true);
+}
+
+Func Func::clone_in(const vector<Func> &fs) {
+    if (fs.empty()) {
+        user_error << "Could not create a clone wrapper for an empty list of Funcs\n";
+    }
+    invalidate_cache();
+    return get_wrapper(func, name() + "_clone", fs, true);
+}
+
+Func Func::copy_to_device(DeviceAPI d) {
+    user_assert(defined())
+        << "copy_to_device on Func " << name() << " with no definition\n";
+    user_assert(outputs() == 1)
+        << "copy_to_device on a Tuple-valued Func " << name() << " not yet supported\n";
+    user_assert(!has_update_definition())
+        << "copy_to_device on Func " << name() << " with update definition\n";
+    user_assert(!is_extern())
+        << "copy_to_device on Func " << name() << " with extern definition\n";
+
+    const Call *call = func.is_wrapper();
+    user_assert(call)
+        << "Func " << name() << " is scheduled as copy_to_host/device, "
+        << "but has value: " << value() << "\n"
+        << "Expected a single call to another Func with matching "
+        << "dimensionality and argument order.\n";
+
+    // Move the RHS value to the proxy slot
+    func.extern_definition_proxy_expr() = value();
+
+    // ... and delete the pure definition
+    func.definition() = Definition();
+
+    ExternFuncArgument buffer;
+    if (call->call_type == Call::Halide) {
+        buffer = call->func;
+    } else if (call->image.defined()) {
+        buffer = call->image;
+    } else {
+        internal_assert(call->param.defined());
+        buffer = call->param;
     }
 
-    IntrusivePtr<FunctionContents> wrapper_contents = iter->second;
-    internal_assert(wrapper_contents.defined());
-    Function wrapper(wrapper_contents);
-    internal_assert(wrapper.frozen());
-    return Func(wrapper);
+    ExternFuncArgument device_interface = make_device_interface_call(d);
+    func.define_extern("halide_buffer_copy", {buffer, device_interface},
+                       {call->type}, func.args(), // Reuse the existing dimension names
+                       NameMangling::C, d, false);
+    return *this;
+}
+
+Func Func::copy_to_host() {
+    user_assert(defined())
+        << "copy_to_host on Func " << name() << " with no definition\n";
+    user_assert(outputs() == 1)
+        << "copy_to_host on a Tuple-valued Func " << name() << " not yet supported\n";
+    user_assert(!has_update_definition())
+        << "copy_to_host on Func " << name() << " with update definition\n";
+    user_assert(!is_extern())
+        << "copy_to_host on Func " << name() << " with extern definition\n";
+    return copy_to_device(DeviceAPI::Host);
 }
 
 Func &Func::split(VarOrRVar old, VarOrRVar outer, VarOrRVar inner, Expr factor, TailStrategy tail) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).split(old, outer, inner, factor, tail);
+    Stage(func, func.definition(), 0, args()).split(old, outer, inner, factor, tail);
     return *this;
 }
 
 Func &Func::fuse(VarOrRVar inner, VarOrRVar outer, VarOrRVar fused) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).fuse(inner, outer, fused);
+    Stage(func, func.definition(), 0, args()).fuse(inner, outer, fused);
     return *this;
 }
 
 Func &Func::rename(VarOrRVar old_name, VarOrRVar new_name) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).rename(old_name, new_name);
+    Stage(func, func.definition(), 0, args()).rename(old_name, new_name);
     return *this;
 }
 
 Func &Func::allow_race_conditions() {
-    Stage(func.definition(), name(), args(), func.schedule()).allow_race_conditions();
+    Stage(func, func.definition(), 0, args()).allow_race_conditions();
     return *this;
 }
 
@@ -1870,55 +1979,61 @@ Func &Func::memoize() {
     return *this;
 }
 
+Func &Func::store_in(MemoryType t) {
+    invalidate_cache();
+    func.schedule().memory_type() = t;
+    return *this;
+}
+
 Stage Func::specialize(Expr c) {
     invalidate_cache();
-    return Stage(func.definition(), name(), args(), func.schedule()).specialize(c);
+    return Stage(func, func.definition(), 0, args()).specialize(c);
 }
 
 void Func::specialize_fail(const std::string &message) {
     invalidate_cache();
-    (void) Stage(func.definition(), name(), args(), func.schedule()).specialize_fail(message);
+    (void) Stage(func, func.definition(), 0, args()).specialize_fail(message);
 }
 
 Func &Func::serial(VarOrRVar var) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).serial(var);
+    Stage(func, func.definition(), 0, args()).serial(var);
     return *this;
 }
 
 Func &Func::parallel(VarOrRVar var) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).parallel(var);
+    Stage(func, func.definition(), 0, args()).parallel(var);
     return *this;
 }
 
 Func &Func::vectorize(VarOrRVar var) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).vectorize(var);
+    Stage(func, func.definition(), 0, args()).vectorize(var);
     return *this;
 }
 
 Func &Func::unroll(VarOrRVar var) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).unroll(var);
+    Stage(func, func.definition(), 0, args()).unroll(var);
     return *this;
 }
 
 Func &Func::parallel(VarOrRVar var, Expr factor, TailStrategy tail) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).parallel(var, factor, tail);
+    Stage(func, func.definition(), 0, args()).parallel(var, factor, tail);
     return *this;
 }
 
 Func &Func::vectorize(VarOrRVar var, Expr factor, TailStrategy tail) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).vectorize(var, factor, tail);
+    Stage(func, func.definition(), 0, args()).vectorize(var, factor, tail);
     return *this;
 }
 
 Func &Func::unroll(VarOrRVar var, Expr factor, TailStrategy tail) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).unroll(var, factor, tail);
+    Stage(func, func.definition(), 0, args()).unroll(var, factor, tail);
     return *this;
 }
 
@@ -1933,12 +2048,7 @@ Func &Func::bound(Var var, Expr min, Expr extent) {
     extent = cast<int32_t>(extent);
 
     invalidate_cache();
-    bool found = false;
-    for (size_t i = 0; i < func.args().size(); i++) {
-        if (var.name() == func.args()[i]) {
-            found = true;
-        }
-    }
+    bool found = func.is_pure_arg(var.name());
     user_assert(found)
         << "Can't bound variable " << var.name()
         << " of function " << name()
@@ -1947,6 +2057,20 @@ Func &Func::bound(Var var, Expr min, Expr extent) {
 
     Bound b = {var.name(), min, extent, Expr(), Expr()};
     func.schedule().bounds().push_back(b);
+    return *this;
+}
+
+Func &Func::estimate(Var var, Expr min, Expr extent) {
+    invalidate_cache();
+    bool found = func.is_pure_arg(var.name());
+    user_assert(found)
+        << "Can't provide an estimate on variable " << var.name()
+        << " of function " << name()
+        << " because " << var.name()
+        << " is not one of the pure variables of " << name() << ".\n";
+
+    Bound b = {var.name(), min, extent, Expr(), Expr()};
+    func.schedule().estimates().push_back(b);
     return *this;
 }
 
@@ -1968,12 +2092,7 @@ Func &Func::align_bounds(Var var, Expr modulus, Expr remainder) {
 
     invalidate_cache();
 
-    bool found = false;
-    for (size_t i = 0; i < func.args().size(); i++) {
-        if (var.name() == func.args()[i]) {
-            found = true;
-        }
-    }
+    bool found = func.is_pure_arg(var.name());
     user_assert(found)
         << "Can't align bounds of variable " << var.name()
         << " of function " << name()
@@ -1991,7 +2110,7 @@ Func &Func::tile(VarOrRVar x, VarOrRVar y,
                  Expr xfactor, Expr yfactor,
                  TailStrategy tail) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).tile(x, y, xo, yo, xi, yi, xfactor, yfactor, tail);
+    Stage(func, func.definition(), 0, args()).tile(x, y, xo, yo, xi, yi, xfactor, yfactor, tail);
     return *this;
 }
 
@@ -2000,91 +2119,91 @@ Func &Func::tile(VarOrRVar x, VarOrRVar y,
                  Expr xfactor, Expr yfactor,
                  TailStrategy tail) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).tile(x, y, xi, yi, xfactor, yfactor, tail);
+    Stage(func, func.definition(), 0, args()).tile(x, y, xi, yi, xfactor, yfactor, tail);
     return *this;
 }
 
 Func &Func::reorder(const std::vector<VarOrRVar> &vars) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).reorder(vars);
+    Stage(func, func.definition(), 0, args()).reorder(vars);
     return *this;
 }
 
 Func &Func::gpu_threads(VarOrRVar tx, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_threads(tx, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_threads(tx, device_api);
     return *this;
 }
 
 Func &Func::gpu_threads(VarOrRVar tx, VarOrRVar ty, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_threads(tx, ty, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_threads(tx, ty, device_api);
     return *this;
 }
 
 Func &Func::gpu_threads(VarOrRVar tx, VarOrRVar ty, VarOrRVar tz, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_threads(tx, ty, tz, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_threads(tx, ty, tz, device_api);
+    return *this;
+}
+
+Func &Func::gpu_lanes(VarOrRVar tx, DeviceAPI device_api) {
+    invalidate_cache();
+    Stage(func, func.definition(), 0, args()).gpu_lanes(tx, device_api);
     return *this;
 }
 
 Func &Func::gpu_blocks(VarOrRVar bx, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_blocks(bx, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_blocks(bx, device_api);
     return *this;
 }
 
 Func &Func::gpu_blocks(VarOrRVar bx, VarOrRVar by, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_blocks(bx, by, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_blocks(bx, by, device_api);
     return *this;
 }
 
 Func &Func::gpu_blocks(VarOrRVar bx, VarOrRVar by, VarOrRVar bz, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_blocks(bx, by, bz, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_blocks(bx, by, bz, device_api);
     return *this;
 }
 
 Func &Func::gpu_single_thread(DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_single_thread(device_api);
+    Stage(func, func.definition(), 0, args()).gpu_single_thread(device_api);
     return *this;
 }
 
 Func &Func::gpu(VarOrRVar bx, VarOrRVar tx, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu(bx, tx, device_api);
+    Stage(func, func.definition(), 0, args()).gpu(bx, tx, device_api);
     return *this;
 }
 
 Func &Func::gpu(VarOrRVar bx, VarOrRVar by, VarOrRVar tx, VarOrRVar ty, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu(bx, by, tx, ty, device_api);
+    Stage(func, func.definition(), 0, args()).gpu(bx, by, tx, ty, device_api);
     return *this;
 }
 
 Func &Func::gpu(VarOrRVar bx, VarOrRVar by, VarOrRVar bz, VarOrRVar tx, VarOrRVar ty, VarOrRVar tz, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu(bx, by, bz, tx, ty, tz, device_api);
+    Stage(func, func.definition(), 0, args()).gpu(bx, by, bz, tx, ty, tz, device_api);
     return *this;
 }
 
-Func &Func::gpu_tile(VarOrRVar x, VarOrRVar bx, Var tx, Expr x_size, TailStrategy tail, DeviceAPI device_api) {
+Func &Func::gpu_tile(VarOrRVar x, VarOrRVar bx, VarOrRVar tx, Expr x_size, TailStrategy tail, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_tile(x, bx, tx, x_size, tail, device_api);
-    return *this;
-}
-
-Func &Func::gpu_tile(VarOrRVar x, VarOrRVar bx, RVar tx, Expr x_size, TailStrategy tail, DeviceAPI device_api) {
-    invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_tile(x, bx, tx, x_size, tail, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_tile(x, bx, tx, x_size, tail, device_api);
     return *this;
 }
 
 Func &Func::gpu_tile(VarOrRVar x, VarOrRVar tx, Expr x_size, TailStrategy tail, DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_tile(x, tx, x_size, tail, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_tile(x, tx, x_size, tail, device_api);
     return *this;
 }
 
@@ -2095,29 +2214,18 @@ Func &Func::gpu_tile(VarOrRVar x, VarOrRVar y,
                      TailStrategy tail,
                      DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule())
+    Stage(func, func.definition(), 0, args())
         .gpu_tile(x, y, bx, by, tx, ty, x_size, y_size, tail, device_api);
     return *this;
 }
 
 Func &Func::gpu_tile(VarOrRVar x, VarOrRVar y,
-                     VarOrRVar tx, Var ty,
+                     VarOrRVar tx, VarOrRVar ty,
                      Expr x_size, Expr y_size,
                      TailStrategy tail,
                      DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule())
-        .gpu_tile(x, y, tx, ty, x_size, y_size, tail, device_api);
-    return *this;
-}
-
-Func &Func::gpu_tile(VarOrRVar x, VarOrRVar y,
-                     VarOrRVar tx, RVar ty,
-                     Expr x_size, Expr y_size,
-                     TailStrategy tail,
-                     DeviceAPI device_api) {
-    invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule())
+    Stage(func, func.definition(), 0, args())
         .gpu_tile(x, y, tx, ty, x_size, y_size, tail, device_api);
     return *this;
 }
@@ -2129,7 +2237,7 @@ Func &Func::gpu_tile(VarOrRVar x, VarOrRVar y, VarOrRVar z,
                      TailStrategy tail,
                      DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule())
+    Stage(func, func.definition(), 0, args())
         .gpu_tile(x, y, z, bx, by, bz, tx, ty, tz, x_size, y_size, z_size, tail, device_api);
     return *this;
 }
@@ -2140,32 +2248,8 @@ Func &Func::gpu_tile(VarOrRVar x, VarOrRVar y, VarOrRVar z,
                      TailStrategy tail,
                      DeviceAPI device_api) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule())
+    Stage(func, func.definition(), 0, args())
         .gpu_tile(x, y, z, tx, ty, tz, x_size, y_size, z_size, tail, device_api);
-    return *this;
-}
-
-Func &Func::gpu_tile(VarOrRVar x, Expr x_size, TailStrategy tail, DeviceAPI device_api) {
-    invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_tile(x, x_size, tail, device_api);
-    return *this;
-}
-
-Func &Func::gpu_tile(VarOrRVar x, VarOrRVar y,
-                     Expr x_size, Expr y_size,
-                     TailStrategy tail,
-                     DeviceAPI device_api) {
-    invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_tile(x, y, x_size, y_size, tail, device_api);
-    return *this;
-}
-
-Func &Func::gpu_tile(VarOrRVar x, VarOrRVar y, VarOrRVar z,
-                     Expr x_size, Expr y_size, Expr z_size,
-                     TailStrategy tail,
-                     DeviceAPI device_api) {
-    invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_tile(x, y, z, x_size, y_size, z_size, tail, device_api);
     return *this;
 }
 
@@ -2178,7 +2262,7 @@ Func &Func::shader(Var x, Var y, Var c, DeviceAPI device_api) {
 
     // TODO: Set appropriate constraints if this is the output buffer?
 
-    Stage(func.definition(), name(), args(), func.schedule()).gpu_blocks(x, y, device_api);
+    Stage(func, func.definition(), 0, args()).gpu_blocks(x, y, device_api);
 
     bool constant_bounds = false;
     FuncSchedule &sched = func.schedule();
@@ -2200,19 +2284,19 @@ Func &Func::glsl(Var x, Var y, Var c) {
 
 Func &Func::hexagon(VarOrRVar x) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).hexagon(x);
+    Stage(func, func.definition(), 0, args()).hexagon(x);
     return *this;
 }
 
 Func &Func::prefetch(const Func &f, VarOrRVar var, Expr offset, PrefetchBoundStrategy strategy) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).prefetch(f, var, offset, strategy);
+    Stage(func, func.definition(), 0, args()).prefetch(f, var, offset, strategy);
     return *this;
 }
 
 Func &Func::prefetch(const Internal::Parameter &param, VarOrRVar var, Expr offset, PrefetchBoundStrategy strategy) {
     invalidate_cache();
-    Stage(func.definition(), name(), args(), func.schedule()).prefetch(param, var, offset, strategy);
+    Stage(func, func.definition(), 0, args()).prefetch(param, var, offset, strategy);
     return *this;
 }
 
@@ -2289,9 +2373,11 @@ Func &Func::fold_storage(Var dim, Expr factor, bool fold_forward) {
 Func &Func::compute_at(LoopLevel loop_level) {
     invalidate_cache();
     func.schedule().compute_level() = loop_level;
-    if (func.schedule().store_level().is_inline()) {
-        func.schedule().store_level() = loop_level;
-    }
+    // We want to set store_level = compute_level iff store_level is inlined,
+    // but we can't do that here, since the value in store_level could
+    // be mutated at any time prior to lowering. Instead, we check at
+    // the start of lowering (via Function::lock_loop_levels() method) and
+    // do the compute_level -> store_level propagation then.
     return *this;
 }
 
@@ -2301,6 +2387,30 @@ Func &Func::compute_at(Func f, RVar var) {
 
 Func &Func::compute_at(Func f, Var var) {
     return compute_at(LoopLevel(f, var));
+}
+
+Func &Func::compute_with(Stage s, VarOrRVar var, const vector<pair<VarOrRVar, LoopAlignStrategy>> &align) {
+    invalidate_cache();
+    Stage(func, func.definition(), 0, args()).compute_with(s, var, align);
+    return *this;
+}
+
+Func &Func::compute_with(Stage s, VarOrRVar var, LoopAlignStrategy align) {
+    invalidate_cache();
+    Stage(func, func.definition(), 0, args()).compute_with(s, var, align);
+    return *this;
+}
+
+Func &Func::compute_with(LoopLevel loop_level, const std::vector<std::pair<VarOrRVar, LoopAlignStrategy>> &align) {
+    invalidate_cache();
+    Stage(func, func.definition(), 0, args()).compute_with(loop_level, align);
+    return *this;
+}
+
+Func &Func::compute_with(LoopLevel loop_level, LoopAlignStrategy align) {
+    invalidate_cache();
+    Stage(func, func.definition(), 0, args()).compute_with(loop_level, align);
+    return *this;
 }
 
 Func &Func::compute_root() {
@@ -2347,6 +2457,12 @@ Func &Func::trace_realizations() {
     return *this;
 }
 
+Func &Func::add_trace_tag(const std::string &trace_tag) {
+    invalidate_cache();
+    func.add_trace_tag(trace_tag);
+    return *this;
+}
+
 void Func::debug_to_file(const string &filename) {
     invalidate_cache();
     func.debug_file() = filename;
@@ -2357,14 +2473,13 @@ Stage Func::update(int idx) {
       "Call to update with index larger than last defined update stage for Func \"" <<
       name() << "\".\n";
     invalidate_cache();
-    return Stage(func.update(idx),
-                 name() + ".update(" + std::to_string(idx) + ")",
-                 args(),
-                 func.schedule());
+    return Stage(func, func.update(idx), idx+1, args());
 }
 
 Func::operator Stage() const {
-    return Stage(func.definition(), name(), args(), func.schedule());
+    user_assert(!func.has_extern_definition())
+        << "Extern func \"" << name() << "\" cannot be converted into Stage\n";
+    return Stage(func, func.definition(), 0, args());
 }
 
 namespace {
@@ -2486,16 +2601,12 @@ Stage FuncRef::operator=(const Tuple &e) {
             expanded_args_str[i] = v->name;
         }
         func.define(expanded_args_str, e.as_vector());
-        return Stage(func.definition(), func.name(), func.args(), func.schedule());
-
+        return Stage(func, func.definition(), 0, func.args());
     } else {
         func.define_update(args, e.as_vector());
 
         size_t update_stage = func.updates().size() - 1;
-        return Stage(func.update(update_stage),
-                     func.name() + ".update(" + std::to_string(update_stage) + ")",
-                     func.args(),
-                     func.schedule());
+        return Stage(func, func.update(update_stage), update_stage, func.args());
     }
 }
 
@@ -2717,32 +2828,39 @@ FuncTupleElementRef::operator Expr() const {
     return Internal::Call::make(func_ref.function(), args, idx);
 }
 
-Realization Func::realize(std::vector<int32_t> sizes, const Target &target) {
+Realization Func::realize(std::vector<int32_t> sizes, const Target &target,
+                          const ParamMap &param_map) {
     user_assert(defined()) << "Can't realize undefined Func.\n";
-    return pipeline().realize(sizes, target);
+    return pipeline().realize(sizes, target, param_map);
 }
 
-Realization Func::realize(int x_size, int y_size, int z_size, int w_size, const Target &target) {
-    return realize({x_size, y_size, z_size, w_size}, target);
+Realization Func::realize(int x_size, int y_size, int z_size, int w_size, const Target &target,
+                          const ParamMap &param_map) {
+    return realize({x_size, y_size, z_size, w_size}, target, param_map);
 }
 
-Realization Func::realize(int x_size, int y_size, int z_size, const Target &target) {
-    return realize({x_size, y_size, z_size}, target);
+Realization Func::realize(int x_size, int y_size, int z_size, const Target &target,
+                          const ParamMap &param_map) {
+    return realize({x_size, y_size, z_size}, target, param_map);
 }
 
-Realization Func::realize(int x_size, int y_size, const Target &target) {
-    return realize({x_size, y_size}, target);
+Realization Func::realize(int x_size, int y_size, const Target &target,
+                          const ParamMap &param_map) {
+    return realize({x_size, y_size}, target, param_map);
 }
 
-Realization Func::realize(int x_size, const Target &target) {
-    return realize(std::vector<int>{x_size}, target);
+Realization Func::realize(int x_size, const Target &target,
+                          const ParamMap &param_map) {
+    return realize(std::vector<int>{x_size}, target, param_map);
 }
 
-Realization Func::realize(const Target &target) {
-    return realize(std::vector<int>{}, target);
+Realization Func::realize(const Target &target,
+                          const ParamMap &param_map) {
+    return realize(std::vector<int>{}, target, param_map);
 }
 
-void Func::infer_input_bounds(int x_size, int y_size, int z_size, int w_size) {
+void Func::infer_input_bounds(int x_size, int y_size, int z_size, int w_size,
+                              const ParamMap &param_map) {
     user_assert(defined()) << "Can't infer input bounds on an undefined Func.\n";
     vector<Buffer<>> outputs(func.outputs());
     int sizes[] = {x_size, y_size, z_size, w_size};
@@ -2759,7 +2877,7 @@ void Func::infer_input_bounds(int x_size, int y_size, int z_size, int w_size) {
         outputs[i] = std::move(im);
     }
     Realization r(outputs);
-    infer_input_bounds(r);
+    infer_input_bounds(r, param_map);
 }
 
 OutputImageParam Func::output_buffer() const {
@@ -2768,7 +2886,7 @@ OutputImageParam Func::output_buffer() const {
     user_assert(func.output_buffers().size() == 1)
         << "Can't call Func::output_buffer on Func \"" << name()
         << "\" because it returns a Tuple.\n";
-    return OutputImageParam(func.output_buffers()[0], Argument::OutputBuffer);
+    return OutputImageParam(func.output_buffers()[0], Argument::OutputBuffer, *this);
 }
 
 vector<OutputImageParam> Func::output_buffers() const {
@@ -2777,7 +2895,7 @@ vector<OutputImageParam> Func::output_buffers() const {
 
     vector<OutputImageParam> bufs(func.output_buffers().size());
     for (size_t i = 0; i < bufs.size(); i++) {
-        bufs[i] = OutputImageParam(func.output_buffers()[i], Argument::OutputBuffer);
+        bufs[i] = OutputImageParam(func.output_buffers()[i], Argument::OutputBuffer, *this);
     }
     return bufs;
 }
@@ -2792,6 +2910,11 @@ Pipeline Func::pipeline() {
 
 vector<Argument> Func::infer_arguments() const {
     return Pipeline(*this).infer_arguments();
+}
+
+std::string Func::source_location() const {
+    user_assert(defined()) << "A Func with no definition has no source_location\n";
+    return func.definition().source_location();
 }
 
 Module Func::compile_to_module(const vector<Argument> &args, const std::string &fn_name, const Target &target) {
@@ -2913,7 +3036,7 @@ void Func::set_custom_print(void (*cust_print)(void *, const char *)) {
     pipeline().set_custom_print(cust_print);
 }
 
-void Func::add_custom_lowering_pass(IRMutator *pass, void (*deleter)(IRMutator *)) {
+void Func::add_custom_lowering_pass(IRMutator2 *pass, std::function<void()> deleter) {
     pipeline().add_custom_lowering_pass(pass, deleter);
 }
 
@@ -2929,20 +3052,22 @@ const Internal::JITHandlers &Func::jit_handlers() {
     return pipeline().jit_handlers();
 }
 
-void Func::realize(Realization dst, const Target &target) {
-    pipeline().realize(dst, target);
+void Func::realize(Pipeline::RealizationArg outputs, const Target &target,
+                   const ParamMap &param_map) {
+    pipeline().realize(std::move(outputs), target, param_map);
 }
 
-void Func::infer_input_bounds(Realization dst) {
-    pipeline().infer_input_bounds(dst);
+void Func::infer_input_bounds(Pipeline::RealizationArg outputs,
+                              const ParamMap &param_map) {
+    pipeline().infer_input_bounds(std::move(outputs), param_map);
 }
 
 void *Func::compile_jit(const Target &target) {
     return pipeline().compile_jit(target);
 }
 
-EXPORT Var _("_");
-EXPORT Var _0("_0"), _1("_1"), _2("_2"), _3("_3"), _4("_4"),
+Var _("_");
+Var _0("_0"), _1("_1"), _2("_2"), _3("_3"), _4("_4"),
            _5("_5"), _6("_6"), _7("_7"), _8("_8"), _9("_9");
 
-}
+}  // namespace Halide
