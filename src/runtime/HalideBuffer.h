@@ -14,6 +14,7 @@
 #include <limits>
 #include <stdint.h>
 #include <string.h>
+#include <cstdlib>
 
 #include "HalideRuntime.h"
 
