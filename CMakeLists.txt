@@ -20,6 +20,9 @@ include(CPack)
 find_package(Threads QUIET)
 
 if("${HALIDE_REQUIRE_LLVM_VERSION}" STREQUAL "")
+  if (APPLE)
+    set(LLVM_DIR /usr/local/opt/llvm/lib/cmake/llvm)
+  endif()
   # Find any version present.
   find_package(LLVM REQUIRED CONFIG)
 else()
