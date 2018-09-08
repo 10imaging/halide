@@ -83,7 +83,7 @@ clean:
 	rm -rf $(BIN)
 
 KERNEL_HEADERS = $(KERNELS:%=$(BUILD)/halide_%.h)
-KERNEL_OBJECTS = $(KERNELS:%=$(BUILD)/halide_%.o) $(BUILD)/halide_runtime.o
+KERNEL_OBJECTS = $(KERNELS:%=$(BUILD)/halide_%.o) $(BUILD)/halide_runtime.a
 
 $(BUILD)/halide_blas.o: src/halide_blas.cpp src/halide_blas.h $(KERNEL_HEADERS)
 	@mkdir -p $(@D)
@@ -206,7 +206,7 @@ $(BUILD)/%.generator: src/%_generators.cpp $(GENERATOR_DEPS)
 	$(CXX) $(CXXFLAGS) -fno-rtti $(filter-out %.h,$^) $(LDFLAGS) -o $@
 
 # This can use any of the generators; pick an arbitrary one
-$(BUILD)/halide_runtime.o: $(BUILD)/blas_l1.generator
+$(BUILD)/halide_runtime.a: $(BUILD)/blas_l1.generator
 	$< -o $(BUILD) -e o -r halide_runtime target=$(HL_TARGET)
 
 $(BUILD)/halide_scopy_impl.o $(BUILD)/halide_scopy_impl.h: $(BUILD)/blas_l1.generator

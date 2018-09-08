@@ -38,15 +38,14 @@ find_package(Eigen3 QUIET)
 if (NOT Eigen3_FOUND)
   message(STATUS "linear_algebra: Eigen3 Missing, skipping Eigen3 benchmarks")
 else()
-  add_executable(eigen_benchmarks
-    eigen_benchmarks.cpp
-  )
+  add_executable(eigen_benchmarks eigen_benchmarks.cpp)
   target_compile_definitions(eigen_benchmarks PRIVATE -DEIGEN_DONT_PARALLELIZE ${MISC_DEFINITIONS})
   target_compile_options(eigen_benchmarks PRIVATE -Wno-error=unused-variable)
-  target_link_libraries(eigen_benchmarks
-    PRIVATE
-      Eigen3::Eigen
-  )
+  if (APPLE)
+    target_include_directories(eigen_benchmarks PRIVATE "/usr/local/opt/eigen/include/eigen3")
+  else ()
+    target_include_directories(eigen_benchmarks PRIVATE "/usr/include/eigen3")
+  endif()
   list(APPEND BLAS_NAMES eigen)
 endif()
 
